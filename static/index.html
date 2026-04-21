@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DeepSearch — Ad-Free</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <!-- ── Header ── -->
+  <header id="site-header" class="header-home">
+    <div class="header-inner">
+      <a href="/" class="logo" id="logo">
+        <span class="logo-deep">Deep</span><span class="logo-search">Search</span>
+        <span class="logo-badge">ad-free</span>
+      </a>
+
+      <!-- inline search bar (shown after first search) -->
+      <form id="header-form" class="header-search-form hidden" autocomplete="off">
+        <input id="header-input" type="search" placeholder="Search the deep web…" spellcheck="false" />
+        <button type="submit" aria-label="Search">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+            <circle cx="8.5" cy="8.5" r="5.5"/>
+            <line x1="13" y1="13" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </form>
+
+      <!-- source filter pills (shown after first search) -->
+      <nav id="source-nav" class="source-nav hidden">
+        <button class="pill active" data-source="all">All</button>
+        <button class="pill" data-source="web">Web</button>
+        <button class="pill" data-source="hackernews">Hacker News</button>
+        <button class="pill" data-source="reddit">Reddit</button>
+        <button class="pill" data-source="wikipedia">Wikipedia</button>
+        <button class="pill" data-source="indie">Indie Web</button>
+        <button class="pill" data-source="archive">Archive</button>
+      </nav>
+    </div>
+  </header>
+
+  <!-- ── Hero (home state) ── -->
+  <main>
+    <section id="hero" class="hero">
+      <div class="hero-logo">
+        <span class="logo-deep">Deep</span><span class="logo-search">Search</span>
+      </div>
+      <p class="hero-tagline">No ads. No sponsored results. No filter bubbles.<br>Just the internet — all of it.</p>
+
+      <form id="hero-form" autocomplete="off">
+        <div class="hero-input-wrap">
+          <svg class="hero-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <circle cx="8.5" cy="8.5" r="5.5"/>
+            <line x1="13" y1="13" x2="18" y2="18"/>
+          </svg>
+          <input id="hero-input" type="search" placeholder="Search anything…" autofocus spellcheck="false" />
+          <button type="submit">Search</button>
+        </div>
+      </form>
+
+      <ul class="source-legend">
+        <li><span class="badge badge-web">Web</span> DuckDuckGo — no tracking</li>
+        <li><span class="badge badge-hackernews">Hacker News</span> Discussions &amp; links</li>
+        <li><span class="badge badge-reddit">Reddit</span> Community knowledge</li>
+        <li><span class="badge badge-wikipedia">Wikipedia</span> Encyclopaedic depth</li>
+        <li><span class="badge badge-indie">Indie Web</span> Non-commercial sites</li>
+        <li><span class="badge badge-archive">Archive</span> Deleted &amp; old pages</li>
+      </ul>
+    </section>
+
+    <!-- ── Results ── -->
+    <section id="results-section" class="results-section hidden">
+      <div id="results-meta" class="results-meta"></div>
+      <div id="results-list" class="results-list"></div>
+      <div id="spinner" class="spinner hidden">
+        <div class="spinner-ring"></div>
+        <span>Searching across sources…</span>
+      </div>
+      <div id="error-msg" class="error-msg hidden"></div>
+    </section>
+  </main>
+
+  <!-- ── Footer ── -->
+  <footer class="site-footer">
+    <p>DeepSearch aggregates DuckDuckGo, Hacker News, Reddit, Wikipedia, Marginalia &amp; Internet Archive.
+    Zero ads. Zero paid placements.</p>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
