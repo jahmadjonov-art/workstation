@@ -323,6 +323,11 @@
   const realFetch = window.fetch ? window.fetch.bind(window) : null;
   window.fetch = async (input, init = {}) => {
     const raw = typeof input === 'string' ? input : input.url;
+    if (raw.startsWith('/api/search')) {  // the demo has no real search engine: show a few sample results
+      const t = decodeURIComponent((raw.split('q=')[1] || '').split('&')[0]);
+      const sample = ['Wikipedia', 'Official site', 'A helpful guide', 'Community discussion'].map((n, i) => ({ title: n + ' about ' + t, url: 'https://example.org/' + i, snippet: 'Sample result. In the real site this is a plain, ad-free result for what you typed.' }));
+      return new Response(JSON.stringify({ q: t, page: 1, results: sample }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
     if (!raw.startsWith('/api/corp/')) return realFetch ? realFetch(input, init) : Promise.reject(new TypeError('offline'));
     const url = new URL(raw, 'http://demo.invalid'), path = url.pathname.slice('/api/corp'.length), method = (init.method || 'GET').toUpperCase();
     const auth = new Headers(init.headers || {}).get('authorization') || '', uid = auth.startsWith('Bearer ') ? db.tokens[auth.slice(7)] : null, me = uid ? user(uid) : null;

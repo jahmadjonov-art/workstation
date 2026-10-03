@@ -623,6 +623,57 @@ def valid_pubkey(k):
     )
 
 
+# ---------- clean web search ----------
+# Results come from a SearXNG instance you run (HUDDLE_SEARCH_URL). It blends many engines and carries no ads.
+# We keep only title, link and snippet, strip tracking tags, never store what anyone searches for, and never
+# tell the search engines who is asking (the request comes from the server).
+SEARCH_URL = os.environ.get("HUDDLE_SEARCH_URL", "").rstrip("/")
+TRACKING_PARAMS = re.compile(r"^(utm_.*|fbclid|gclid|gclsrc|dclid|msclkid|mc_eid|mc_cid|igshid|yclid|_hsenc|_hsmi|ref_src|ref_url|spm)$", re.I)
+AD_HOSTS = ("doubleclick.net", "googleadservices.com", "googlesyndication.com", "adservice.google.com")
+
+
+def untrack(u: str):
+    p = urlparse(u)
+    if p.scheme not in ("http", "https") or not p.hostname or p.username or p.password:
+        return None
+    host = p.hostname.lower()
+    if any(host == h or host.endswith("." + h) for h in AD_HOSTS) or p.path.startswith("/aclk"):
+        return None
+    from urllib.parse import parse_qsl, urlencode, urlunparse
+    q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if not TRACKING_PARAMS.match(k)]
+    return urlunparse(p._replace(query=urlencode(q), fragment=""))
+
+
+@app.get("/api/search")
+def web_search(request: Request, q: str = "", page: int = 1):
+    q = q.strip()[:200]
+    if not q:
+        raise HTTPException(400, "Type something to search for.")
+    if not SEARCH_URL:
+        raise HTTPException(503, "Web search isn't switched on for this site yet.")
+    limiter.check(f"search:{client_ip(request)}", 30, 60, "Searching too fast. Give it a few seconds.")
+    import urllib.parse, urllib.request
+    qs = urllib.parse.urlencode({"q": q, "format": "json", "pageno": max(1, min(page, 5)), "safesearch": 1})
+    try:
+        req = urllib.request.Request(f"{SEARCH_URL}/search?{qs}", headers={"Accept": "application/json", "User-Agent": "Huddle-search"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read(2_000_000))
+    except Exception:
+        raise HTTPException(502, "Search is having trouble right now. Try again in a moment.")
+    out, seen = [], set()
+    for it in (data.get("results") or []):
+        if not isinstance(it, dict):
+            continue
+        url = untrack(str(it.get("url") or ""))
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append({"title": str(it.get("title") or url)[:200], "url": url, "snippet": str(it.get("content") or "")[:400]})
+        if len(out) >= 20:
+            break
+    return {"q": q, "page": page, "results": out}
+
+
 @app.get("/api/pow")
 def get_pow(request: Request):
     limiter.check(f"pow:{client_ip(request)}", 30, HOUR)

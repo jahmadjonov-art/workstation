@@ -78,14 +78,14 @@ def body_of(html: str) -> str:
 
 def huddle_payload():
     app = no_download(read(STATIC / "app.js"), "downloadAccountFile", "Login files are not used in the demo.")
-    return {"css": read(STATIC / "style.css") + DEMO_CSS, "markup": HUDDLE_BAR + "\n" + body_of(read(STATIC / "index.html")),
-            "scripts": ["window.__DEMO = true;\n" + read(HERE / "mock-backend.js"), app, HUDDLE_JS]}
+    return {"css": read(STATIC / "style.css") + read(STATIC / "search.css") + DEMO_CSS, "markup": HUDDLE_BAR + "\n" + body_of(read(STATIC / "index.html")),
+            "scripts": ["window.__DEMO = true;\n" + read(HERE / "mock-backend.js"), read(STATIC / "search.js"), app, HUDDLE_JS]}
 
 
 def corp_payload():
     corp = no_download(read(STATIC / "corp.js"), "downloadLoginFile", "Login files are not used in the demo.")
-    return {"css": read(STATIC / "corp.css") + DEMO_CSS, "markup": CORP_BAR + "\n" + body_of(read(STATIC / "corp.html")),
-            "scripts": ["window.__DEMO = true;\n" + read(STATIC / "crypto.js"), read(HERE / "mock-corp-backend.js"), corp, CORP_JS]}
+    return {"css": read(STATIC / "corp.css") + read(STATIC / "search.css") + DEMO_CSS, "markup": CORP_BAR + "\n" + body_of(read(STATIC / "corp.html")),
+            "scripts": ["window.__DEMO = true;\n" + read(STATIC / "crypto.js"), read(HERE / "mock-corp-backend.js"), read(STATIC / "search.js"), corp, CORP_JS]}
 
 
 def landing_parts():

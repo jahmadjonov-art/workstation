@@ -240,3 +240,44 @@ def test_people_cannot_change_each_others_things_on_the_social_site(c):
     assert c.get(f"/api/users/{b.id}").json()["name"] == "B"
     assert c.get(f"/api/dm/{b.id}", headers=a.h).json() == []  # a only ever sees their own thread with b
     assert c.post(f"/api/requests/{b.id}/accept", headers=a.h).status_code == 404
+
+
+# ---------- clean web search ----------
+@pytest.fixture()
+def fake_search(monkeypatch):
+    import http.server, threading
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.path + "|" + str(self.headers.get("Cookie")) + "|" + str(self.headers.get("X-Forwarded-For")))
+            body = json.dumps({"results": [
+                {"title": "Real result", "url": "https://example.org/page?utm_source=x&id=7&fbclid=abc#frag", "content": "plain snippet"},
+                {"title": "An ad", "url": "https://googleadservices.com/pagead/aclk?x=1", "content": "buy"},
+                {"title": "Sneaky", "url": "javascript:alert(1)", "content": "x"},
+                {"title": "Login trick", "url": "https://bank.com@evil.site/", "content": "x"},
+                {"title": "Dupe", "url": "https://example.org/page?id=7", "content": "x"},
+            ]}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+
+        def log_message(self, *a): pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(server, "SEARCH_URL", f"http://127.0.0.1:{srv.server_port}")
+    yield seen
+    srv.shutdown()
+
+
+def test_search_is_clean_ad_free_and_anonymous(c, fake_search):
+    r = c.get("/api/search", params={"q": "best hiking boots"}, headers={"Cookie": "huddle=secret", "X-Forwarded-For": "1.2.3.4"})
+    assert r.status_code == 200
+    res = r.json()["results"]
+    assert [x["title"] for x in res] == ["Real result"]  # ad, javascript:, embedded-login and duplicate are all dropped
+    assert res[0]["url"] == "https://example.org/page?id=7"  # tracking tags and fragment stripped
+    assert "secret" not in fake_search[0] and "1.2.3.4" not in fake_search[0]  # the search engine never learns who asked
+
+
+def test_search_off_when_unconfigured_and_rate_limited(c, monkeypatch):
+    monkeypatch.setattr(server, "SEARCH_URL", "")
+    assert c.get("/api/search", params={"q": "x"}).status_code == 503
+    assert c.get("/api/search", params={"q": " "}).status_code == 400

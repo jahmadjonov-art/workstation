@@ -6,6 +6,7 @@
 <title>Huddle: meet people who share your interests</title>
 <meta name="theme-color" content="#292f33">
 <link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/search.css">
 </head>
 <body>
 <header class="topbar"><div class="wrap">
@@ -15,6 +16,7 @@
     <a href="#/groups">Groups</a>
     <a href="#/events">Events</a>
     <a href="#/people">People</a>
+    <a href="#/web">Search</a>
     <a href="#/inbox">Messages<span class="badge" id="mbadge"></span></a>
   </nav>
   <form id="search" role="search"><input type="search" placeholder="Search events" aria-label="Search events"></form>
@@ -35,6 +37,7 @@
   }
   if (location.protocol === 'file:') huddleOffline();
 </script>
+<script src="/static/search.js"></script>
 <script src="/static/app.js"></script>
 <script>if (!window.__appLoaded) huddleOffline();</script>
 </body>

@@ -1,0 +1,4 @@
+.websearch h2{margin:0 0 10px}#wsform{display:flex;gap:8px}#wsform input{flex:1;min-width:0}
+.wsr{padding:10px 0;border-top:1px solid var(--line)}.wsr:first-child{border-top:0}
+.wst{font-size:1.05rem;font-weight:600;color:var(--link)}.wsu{color:var(--sub);font-size:.82rem;margin:1px 0 3px;word-break:break-all}.wss{font-size:.92rem}
+.wsgo{padding:8px 0}.wsgo a{font-weight:600}

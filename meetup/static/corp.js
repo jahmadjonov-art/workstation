@@ -148,7 +148,7 @@ const scopePicker = (id, selected) => `<select id="${id}">${W.scopes.filter(s =>
 const scopeMembers = scopeId => (scopeById(scopeId)?.member_ids || []).map(member).filter(Boolean);
 
 /* ---------- layout ---------- */
-const NAV = [['#/', 'Home'], ['#/chat', 'Chat'], ['#/tasks', 'Tasks'], ['#/workflows', 'Workflows'], ['#/pages', 'Pages'], ['#/events', 'Events'], ['#/incentives', 'Incentives'], ['#/people', 'People']];
+const NAV = [['#/', 'Home'], ['#/chat', 'Chat'], ['#/tasks', 'Tasks'], ['#/workflows', 'Workflows'], ['#/pages', 'Pages'], ['#/events', 'Events'], ['#/incentives', 'Incentives'], ['#/people', 'People'], ['#/web', 'Search']];
 function shell(main) {
   if (!me || !W) return `<div class="solo">${main}</div>`;
   return `<div class="cshell"><nav class="side" aria-label="Workspace">${NAV.map(([h, l]) => `<a href="${h}" data-nav="${h}">${l}</a>`).join('')}
@@ -742,7 +742,7 @@ const routes = [
   [/^#\/join\/(.+)/, joinPage, false], [/^#\/new/, newWorkspace, false], [/^#\/login/, loginPage, false],
   [/^#\/chat(?:\/(\d+))?/, chat, true], [/^#\/tasks/, tasks, true], [/^#\/workflows/, workflows, true],
   [/^#\/pages(?:\/(new|\d+))?/, pages, true], [/^#\/events/, events, true], [/^#\/incentives/, incentives, true],
-  [/^#\/people/, people, true], [/^#\/settings/, settings, true],
+  [/^#\/web/, () => searchView(app, shell, esc), true], [/^#\/web/, () => searchView(app, shell, esc), true], [/^#\/people/, people, true], [/^#\/settings/, settings, true],
 ];
 async function route() {
   const h = location.hash || '#/'; const seq = ++routeSeq;

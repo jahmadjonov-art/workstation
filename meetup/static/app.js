@@ -771,13 +771,13 @@ async function dm(other) {
 const routes = [
   [/^#\/event\/(\d+)/, eventPage], [/^#\/events/, events], [/^#\/user\/(\d+)/, userPage], [/^#\/dm\/(\d+)/, dm], [/^#\/post\/(\d+)/, postPage],
   [/^#\/groups\/new/, createGroup], [/^#\/groups/, groups], [/^#\/group\/(\d+)/, groupPage],
-  [/^#\/people/, people], [/^#\/join/, join], [/^#\/login/, login], [/^#\/settings/, settings], [/^#\/create/, create], [/^#\/inbox/, inbox],
+  [/^#\/web/, () => searchView(app, m => shell(m, { solo: true }), esc)], [/^#\/web/, () => searchView(app, m => shell(m, { solo: true }), esc)], [/^#\/people/, people], [/^#\/join/, join], [/^#\/login/, login], [/^#\/settings/, settings], [/^#\/create/, create], [/^#\/inbox/, inbox],
 ];
 async function route() {
   const h = location.hash || '#/';
   const seq = ++routeSeq;
   timers.forEach(clearInterval); timers = [];
-  const group = /^#\/groups?(\/|$)/.test(h) ? '#/groups' : /^#\/(events?|create)/.test(h) ? '#/events' : /^#\/(inbox|dm)/.test(h) ? '#/inbox' : /^#\/people/.test(h) ? '#/people' : /^#\/(user|join|login|settings)/.test(h) ? '' : '#/';
+  const group = /^#\/groups?(\/|$)/.test(h) ? '#/groups' : /^#\/(events?|create)/.test(h) ? '#/events' : /^#\/(inbox|dm)/.test(h) ? '#/inbox' : /^#\/people/.test(h) ? '#/people' : /^#\/(user|join|login|settings)/.test(h) ? '' : /^#\/web/.test(h) ? '#/web' : '#/';
   document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.getAttribute('href') === group));
   window.scrollTo({ top: 0 });
   if (me) { try { me = await api('/me'); } catch {} }  // keep profile-card counts fresh
