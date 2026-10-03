@@ -3,21 +3,22 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Huddle: meet people who click</title>
-<meta name="theme-color" content="#f6f2ea">
+<title>Huddle: meet people who share your interests</title>
+<meta name="theme-color" content="#292f33">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header class="top">
-  <a class="logo" href="#/">Huddle<span>.</span></a>
+<header class="topbar"><div class="wrap">
+  <a class="logo" href="#/">huddle</a>
   <nav>
-    <a href="#/">Events</a>
-    <a href="#/feed">Feed</a>
+    <a href="#/">Home</a>
+    <a href="#/events">Events</a>
     <a href="#/people">People</a>
     <a href="#/inbox">Messages<span class="badge" id="mbadge"></span></a>
   </nav>
+  <form id="search" role="search"><input type="search" placeholder="Search events" aria-label="Search events"></form>
   <div id="me"></div>
-</header>
+</div></header>
 <div id="banner"></div>
 <main id="app"></main>
 <div id="toast" role="status"></div>

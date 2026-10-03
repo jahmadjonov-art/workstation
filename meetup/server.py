@@ -536,7 +536,13 @@ def signup(u: SignupIn, request: Request):
 
 @app.get("/api/me")
 def whoami(me=Depends(me_req)):
-    return me
+    with db() as conn:
+        posts = conn.execute("SELECT COUNT(*) FROM posts WHERE user_id=?", (me["id"],)).fetchone()[0]
+        events = conn.execute(
+            "SELECT COUNT(*) FROM rsvps s JOIN events e ON e.id=s.event_id WHERE s.user_id=? AND e.starts>=?",
+            (me["id"], datetime.now().isoformat(timespec="minutes")),
+        ).fetchone()[0]
+    return {**me, "stats": {"posts": posts, "events": events}}
 
 
 @app.put("/api/me")
@@ -574,6 +580,18 @@ def profile(uid: int, v=Depends(me_opt)):
             u["chat"] = chat_state(conn, v["id"], uid)
             u["can_message"] = u["chat"] != "unavailable"
         return u
+
+
+@app.get("/api/users/{uid}/posts")
+def user_posts(uid: int, v=Depends(me_opt)):
+    with db() as conn:
+        if uid in hidden_users(conn, v["id"] if v else 0):
+            return []
+        u = conn.execute("SELECT suspended, deleted FROM users WHERE id=?", (uid,)).fetchone()
+        if not u or u["suspended"] or u["deleted"]:
+            raise HTTPException(404, "This account no longer exists")
+        rows = conn.execute("SELECT * FROM posts WHERE user_id=? ORDER BY id DESC LIMIT 30", (uid,)).fetchall()
+        return [post_dict(conn, r, v["id"] if v else 0) for r in rows]
 
 
 @app.get("/api/me/matches")

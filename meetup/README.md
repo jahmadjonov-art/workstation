@@ -20,12 +20,10 @@ Open http://localhost:8000. A SQLite database (`huddle.db`) is created and seede
   accepts. Declining is silent and permanent, so the sender just keeps seeing "Request sent" and can't pester.
   Requests can be reported before accepting. A badge on Messages shows how many are waiting.
 - **Live chats**: they update on their own, and a waiting screen unlocks by itself the moment a request is accepted.
-- **A calm, polished look**: ivory/ink/gold palette with a dark mode, serif headings, frosted header, springy
-  hover and press feedback, animated menus, dialogs and chat bubbles, skeleton loading, and a phone layout.
-  Motion is switched off for people who prefer reduced motion. No third-party fonts or requests.
-- **Block in one tap** from a profile, chat, post or reply, with Undo; manage the list in Settings.
-- **Delete your account in two taps** (Settings): messages, posts, RSVPs, hosted events and keys are erased.
-  Safety reports involving the account are retained so abuse can still be investigated.
+- **A plain, friendly timeline look** in the spirit of the early-2010s social web: charcoal top bar, three columns
+  (your profile card, the timeline, "people you may like" and nearby events), flat white panels with thin rules,
+  blue links and #hashtags, calendar-page date blocks for events, and a classic dim dark mode. Fast, subtle hover
+  fades only; motion is off for people who prefer reduced motion. System fonts, no third-party requests.
 
 ## Connection features
 - **Interest matching**: events and people ranked by what you have in common ("Best for me", People tab).

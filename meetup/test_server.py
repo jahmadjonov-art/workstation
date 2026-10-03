@@ -293,3 +293,16 @@ def test_profile_chat_state_and_post_reports(c):
     mod = {"X-Mod-Key": "m" * 32}
     assert c.delete(f"/api/mod/posts/{pid}", headers=mod).status_code == 200
     assert c.get(f"/api/posts/{pid}").status_code == 404
+
+
+def test_me_stats_and_user_posts(c):
+    a, b = Person(c, "A"), Person(c, "B")
+    c.post("/api/posts", headers=a.h, json={"body": "first"})
+    c.post("/api/posts", headers=a.h, json={"body": "second"})
+    a.rsvp(1)
+    assert c.get("/api/me", headers=a.h).json()["stats"] == {"posts": 2, "events": 1}
+    assert [p["body"] for p in c.get(f"/api/users/{a.id}/posts").json()] == ["second", "first"]
+    c.put(f"/api/blocks/{a.id}", headers=b.h)
+    assert c.get(f"/api/users/{a.id}/posts", headers=b.h).json() == []
+    c.delete("/api/me", headers=a.h)
+    assert c.get(f"/api/users/{a.id}/posts").status_code == 404
