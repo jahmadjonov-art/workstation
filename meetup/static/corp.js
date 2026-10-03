@@ -169,8 +169,19 @@ function renderBanner() {
   const show = me && myPriv() && !store.get('corp_saved_' + me.user.id);
   el.innerHTML = show ? '<div class="banner">Save your login file. It holds your private encryption key: without it, nobody (including us) can recover your messages. <button class="btn small" data-act="save-login">Save it</button></div>' : '';
 }
+// One login file can carry both accounts (Corp and social). They stay separate on the server; only this device links them.
+function otherSide() {
+  const uid = store.get('huddle_uid'), tok = store.get('huddle_token'), key = uid && store.get('huddle_priv_' + uid);
+  return tok && key ? { user_id: +uid, token: tok, private_key: JSON.parse(key) } : null;
+}
+function importOther(f) {
+  const h = f && f.with_huddle;
+  if (h && h.token && h.user_id && h.private_key) {
+    store.set('huddle_token', h.token); store.set('huddle_uid', String(h.user_id)); store.set('huddle_priv_' + h.user_id, JSON.stringify(h.private_key)); store.set('huddle_saved_' + h.user_id, '1');
+  }
+}
 function downloadLoginFile() {
-  const blob = new Blob([JSON.stringify({ huddle_corp: 1, user_id: me.user.id, token: token(), private_key: myPriv(), workspace_id: wid })], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify({ huddle_corp: 1, user_id: me.user.id, token: token(), private_key: myPriv(), workspace_id: wid, with_huddle: otherSide() })], { type: 'application/json' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `huddle-corp-login-${me.user.name.split(' ')[0].toLowerCase()}.json`; a.click();
   store.set('corp_saved_' + me.user.id, '1'); renderBanner();
 }
@@ -185,6 +196,7 @@ async function loadMe() {
     if (pick) { try { await loadWorkspace(pick.id); } catch {} }
     else { W = null; wid = null; }
   }
+  if (me) store.set('corp_uid', String(me.user.id));
   renderTop(); renderBanner();
 }
 async function startSession(tok, userId, priv) {
@@ -261,6 +273,8 @@ async function loginPage() {
   $('#restore').addEventListener('change', async ev => {
     try {
       const f = JSON.parse(await ev.target.files[0].text());
+      importOther(f);
+      if (f.huddle && f.with_corp) Object.assign(f, f.with_corp, { huddle_corp: 1 });
       if (!f.huddle_corp || !f.token || !f.user_id || !f.private_key) throw new Error();
       if (f.workspace_id) store.set('corp_wid', String(f.workspace_id));
       await startSession(f.token, f.user_id, f.private_key);

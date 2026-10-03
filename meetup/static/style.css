@@ -201,3 +201,5 @@ dialog.lightbox{max-width:min(94vw,900px);width:auto;padding:12px;background:var
 fieldset.ask{border:1px solid var(--line2);border-radius:4px;margin:18px 0 6px;padding:6px 14px 12px}fieldset.ask legend{font-weight:700;padding:0 6px}
 .choice{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line2);border-radius:4px;padding:11px 12px;margin:8px 0;cursor:pointer;font-weight:400;transition:border-color .12s,background .12s}
 .choice:hover{border-color:var(--sub)}.choice:has(input:checked){border-color:var(--blue);background:var(--blue-soft)}.choice input{width:auto;margin-top:3px}.choice b{display:block}.choice small{display:block;line-height:1.35}
+
+.prodswitch{color:var(--bar-text,#fff);font-size:.84rem;opacity:.85;white-space:nowrap;margin-right:6px}.prodswitch:hover{opacity:1;text-decoration:underline}@media(max-width:700px){.prodswitch{display:none}}

@@ -72,8 +72,20 @@ async function solvePow(challenge, bits, onProgress) {
     if (i % 4000 === 0) { onProgress?.(i); await new Promise(r => setTimeout(r)); }
   }
 }
+// One login file can carry both accounts (social and Corp). They stay separate on the server; only this device links them.
+function otherSide() {
+  const uid = store.get('corp_uid'), tok = store.get('corp_token'), key = uid && store.get('corp_priv_' + uid);
+  return tok && key ? { user_id: +uid, token: tok, private_key: JSON.parse(key), workspace_id: +store.get('corp_wid') || null } : null;
+}
+function importOther(f) {
+  const c = f && f.with_corp;
+  if (c && c.token && c.user_id && c.private_key) {
+    store.set('corp_token', c.token); store.set('corp_uid', String(c.user_id)); store.set('corp_priv_' + c.user_id, JSON.stringify(c.private_key));
+    if (c.workspace_id) store.set('corp_wid', String(c.workspace_id)); store.set('corp_saved_' + c.user_id, '1');
+  }
+}
 function downloadAccountFile() {
-  const blob = new Blob([JSON.stringify({ huddle: 1, user_id: me.id, token: token(), private_key: privJwk() })], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify({ huddle: 1, user_id: me.id, token: token(), private_key: privJwk(), with_corp: otherSide() })], { type: 'application/json' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `huddle-login-${me.name.split(' ')[0].toLowerCase()}.json`; a.click();
   store.set('huddle_saved_' + me.id, '1'); renderBanner();
 }
@@ -115,6 +127,7 @@ let dmCtx = null, searchQ = '', feedScope = null, feedTag = '';
 async function loadMe() {
   me = null;
   if (token()) { try { me = await api('/me'); } catch (e) { if (/sign in|suspended/.test(e.message)) store.del('huddle_token'); } }
+  if (me) store.set('huddle_uid', String(me.id));
   $('#me').innerHTML = me
     ? `<details class="more usermenu"><summary>${avatar(me)}<span>${esc(me.name.split(' ')[0])}</span></summary><div>
         <a href="#/user/${me.id}">My profile</a><a href="#/settings">Settings</a><button data-act="signout">Sign out</button></div></details>`
@@ -623,6 +636,8 @@ function login() {
   $('#restore').addEventListener('change', async ev => {
     try {
       const f = JSON.parse(await ev.target.files[0].text());
+      importOther(f);
+      if (f.huddle_corp && f.with_huddle) Object.assign(f, f.with_huddle, { huddle: 1 });
       if (!f.huddle || !f.token || !f.user_id) throw new Error();
       store.set('huddle_token', f.token); if (f.private_key) store.set('huddle_priv_' + f.user_id, JSON.stringify(f.private_key));
       await loadMe(); if (!me) throw new Error(); store.set('huddle_saved_' + me.id, '1'); renderBanner();

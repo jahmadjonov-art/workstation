@@ -32,6 +32,7 @@ HUDDLE_JS = """
   const go = document.getElementById('demo-go');
   setInterval(() => { go.hidden = !!me; }, 400); go.hidden = !!me;
   document.getElementById('demo-home').onclick = () => location.reload();
+  document.addEventListener('click', e => { if (e.target.closest('a.prodswitch')) { e.preventDefault(); location.reload(); } });
   go.onclick = async () => {
     go.disabled = true;
     try {

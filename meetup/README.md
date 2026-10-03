@@ -104,7 +104,7 @@ database access can read DMs. Both people can compare a safety number to detect 
   Other conversations stay private. Nothing else gives moderators DM access.
 - Event chats, profiles and events are not E2EE (they are public to attendees), so moderators can read and
   delete them, and users are told they are reviewed.
-- Moderator API (`/api/mod/*`, see `/docs`): list/read/resolve reports (child-safety reports sorted first),
+- Moderator API (`/api/mod/*`; set `HUDDLE_DOCS=1` to expose `/docs`, off by default): list/read/resolve reports (child-safety reports sorted first),
   suspend users, read/delete event messages, read the audit log. Auth: `X-Mod-Key` header matching the
   `HUDDLE_MOD_KEY` env var (24+ chars; the API is disabled if unset). Every call is written to an audit log.
 - Safety by design: 18+ only (birth date checked once, not stored), every new conversation starts as a request
@@ -137,10 +137,18 @@ Examples to look at: PhotoDNA, NCMEC hash lists via an approved provider, Cloudf
 | `HUDDLE_MOD_KEY` | Enables the moderator API (24+ chars) |
 | `HUDDLE_SECRET` | Signs sign-up challenges; set it so they survive restarts and multiple workers |
 | `HUDDLE_TRUST_PROXY=1` | Use `X-Forwarded-For` for the client IP, only behind a proxy you control |
+| `HUDDLE_DOCS=1` | Serve the interactive API docs at `/docs` (off by default so the API map isn't public) |
+| `HUDDLE_HSTS=1` | Send `Strict-Transport-Security`; turn on once you serve over HTTPS |
 | `HUDDLE_DB` | SQLite path |
 | `HUDDLE_UPLOADS` | Folder for uploaded photos and videos (default `meetup/uploads/`) |
 | `HUDDLE_MEDIA_SCAN_URL` | Safety scanner every upload is sent to before it is stored |
 | `HUDDLE_SCAN_FAIL_OPEN` | `1` lets uploads through if the scanner is down (default: fail closed) |
+
+## One place, two accounts
+Huddle and Huddle Corp live on the same domain (`/huddle` and `/corp`). A **Huddle Corp** link in the social header and a **Switch to Huddle** link in the Corp header move between them. The login file you download from either side can carry both accounts, so one file signs you in to both on a new device. The server keeps the two accounts completely unlinked: your work identity is never visible to the social side and vice versa; only your own device knows both. Because both run on one origin, the strict Content-Security-Policy and output escaping are what keep one side from touching the other (see `SECURITY.md`).
+
+## Revenue principles (not built yet)
+Ads are a future option, not a feature today. If added: contextual to a group's topic (a camping group sees camping gear), sparse, clearly labelled "Sponsored", with no tracking across groups and none in DMs. Huddle Corp never shows ads; a small paid plan for Corp is possible later. The 18+ side stays ad-free unless decided otherwise.
 
 ## Before going public
 - **Scan uploads** for child sexual abuse material (see above), and have a process for reporting it. In the US,
