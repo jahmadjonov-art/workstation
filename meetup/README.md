@@ -1,11 +1,52 @@
 # Huddle
 
+Two separate products on one site:
+
+| Path | Product |
+|---|---|
+| `/` | A chooser, like the front door of huddle.com |
+| `/huddle` | **Huddle**: meet people near you (events, groups, feed, photos, private messages) |
+| `/corp` | **Huddle Corp**: private, end-to-end encrypted workspaces for companies |
+
+They have different accounts, tables and APIs (`/api/...` and `/api/corp/...`). Nothing is shared between them. The rest of
+this README is about Huddle until the Huddle Corp section below.
+
 A meetup site focused on connection: see who's going, what you share with them, and say hello easily. Open to everyone.
 
+## Huddle Corp (private company workspaces)
+A company creates a workspace and invites its people. Inside: **chat** (channels, direct messages, private groups),
+**tasks** (a board with status, assignee, due date and comments), **workflows** (a checklist you run for a person or
+project, which creates owned, dated tasks, with a built-in *New hire onboarding*), **pages** (company page, handbook,
+policies), **events** with RSVPs, **incentive programs**, and a **People** directory with roles (owner, admin, manager,
+member), job titles, new-hire flags and key fingerprints. Admins can create invite links; owners can delete the workspace.
+
+**What "encrypted" means here.** All content (messages, task titles and details, comments, pages, workflows, events, incentives)
+is encrypted in the member's browser (AES-GCM). Each *scope* (the whole company, or a private group) has its own key.
+Keys are handed to teammates wrapped with an ECDH-derived secret, automatically, by any member who already holds the key,
+so no one needs a server-side key and no admin needs to be online. Ciphertext is bound to its workspace, scope, type and
+parent, so the server can't move it elsewhere. When someone is removed from a scope the key is rotated by a remaining
+member's browser, so they can't read what is said afterwards. Private groups are cryptographically private, not just hidden.
+
+**What the server can see:** who is in a workspace and scope, roles and titles, task status / assignee / due date, event
+times, who created what and when, and the activity log (actions, never content). That is what lets the app work.
+
+**Limits, stated plainly**
+- Huddle can't read content, reset a lost key, or search it. Search happens in the browser. A lost login file means lost
+  access, so sign-up and Settings push people to save it. A teammate who still holds the key can be re-invited.
+- A *malicious server operator* could add a fake member and receive key grants. Members can compare the key fingerprints on
+  the People page to catch this. Signed membership (as in the MLS protocol) would close the gap.
+- Removing someone doesn't erase what they already read or copied, and old messages stay under the old key.
+- Huddle can't moderate encrypted workspaces, so the terms of service need to carry that, and there is no legal-hold or
+  eDiscovery export yet. Both matter to larger companies.
+- Not built yet: SSO/SAML, two-factor, email verification, file attachments, search, notifications, owner transfer.
+- Run it on its own origin in production (for example `corp.example.com`) so a bug in the social site can never reach
+  workspace keys, which live in the browser's storage for the same origin.
+
 ## Try it without a server
-`python demo/build_demo.py` writes `demo/dist/huddle-demo.html`: one file you can double-click. It is the real
-front end talking to a pretend server inside the page (`demo/mock-backend.js`), seeded with sample people who
-have real encryption keys and answer message requests. Nothing is saved and reloading starts over. Use it to
+`python demo/build_demo.py` writes `demo/dist/huddle-demo.html`: one file you can double-click. It opens on the same
+chooser as the real site. Both products are the real front ends talking to pretend servers inside the page
+(`demo/mock-backend.js`, `demo/mock-corp-backend.js`), seeded with sample people who have real encryption keys.
+In Huddle Corp you jump in as an admin of a pretend company whose teammates reply in genuinely encrypted channels. Nothing is saved and reloading starts over. Use it to
 look around or show the site to someone.
 
 Opening `static/index.html` directly does not work, because the real site needs its server. The page now says
@@ -17,7 +58,7 @@ cd meetup
 pip install -r requirements.txt
 uvicorn server:app --reload
 ```
-Open http://localhost:8000. A SQLite database (`huddle.db`) is created and seeded with sample data on first start.
+Open http://localhost:8000 for the chooser, http://localhost:8000/huddle for the social site, or http://localhost:8000/corp for Huddle Corp. A SQLite database (`huddle.db`) is created and seeded with sample data on first start.
 
 ## What it feels like
 - **Join in under a minute**: first name, city, birthday, tap a few interests, one button. No password or email.
@@ -117,4 +158,4 @@ Examples to look at: PhotoDNA, NCMEC hash lists via an approved provider, Cloudf
 - Add optional email or phone verification, and move rate limiting to Redis when running multiple workers.
 
 ## Tests
-`pytest -q` runs API tests covering sign-up abuse protection, ciphertext-only storage, moderator boundaries, blocking, the feed, account deletion and limits.
+`pytest -q` runs the API tests: sign-up abuse protection, ciphertext-only storage, moderator boundaries, blocking, the feed, uploads, groups and the 18+ side, and Huddle Corp (key grants and rotation, roles, private groups, invites, workflow runs, and that the database never holds readable content).

@@ -236,6 +236,10 @@ def seed_posts(conn):
 def startup():
     with db() as conn:
         migrate(conn)
+        conn.executescript(_corp.SCHEMA)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(corp_invites)")}
+        if "new_hire" not in cols:
+            conn.execute("ALTER TABLE corp_invites ADD COLUMN new_hire INTEGER NOT NULL DEFAULT 1")
         seed(conn)
         seed_posts(conn)
     if not SCAN_URL:
@@ -1690,9 +1694,23 @@ def mod_audit_log(limit: int = 100, mod=Depends(mod_req)):
         return [dict(r) for r in conn.execute("SELECT * FROM mod_audit ORDER BY id DESC LIMIT ?", (min(max(limit, 1), 500),))]
 
 
+# ── Huddle Corp: private encrypted workspaces for companies (separate accounts, tables and API) ──
+import corp as _corp
+from types import SimpleNamespace
+
+app.include_router(_corp.build(SimpleNamespace(
+    db=db, limiter=limiter, now=now, client_ip=client_ip, make_challenge=make_challenge, verify_pow=verify_pow,
+    valid_pubkey=valid_pubkey, HOUR=HOUR, DAY=DAY)))
+
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
+
+# Three front doors: / lets people choose, /huddle is the social site, /corp is Huddle Corp.
+PAGES = {"": "landing.html", "huddle": "index.html", "corp": "corp.html"}
 
 
 @app.get("/{path:path}")
 def spa(path: str):
-    return FileResponse(BASE / "static" / "index.html")
+    page = PAGES.get(path.strip("/"))
+    if not page:
+        raise HTTPException(404, "Not found")
+    return FileResponse(BASE / "static" / page)
