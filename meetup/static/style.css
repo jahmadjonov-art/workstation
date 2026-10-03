@@ -49,7 +49,7 @@ main{max-width:980px;margin:0 auto;padding:14px 14px 70px}
 
 /* boxes */
 .box{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:14px}
-.box+.box{margin-top:14px}.left .box+.box,.right .box+.box{margin-top:10px}
+.box.flush{padding:0}.box+.box{margin-top:14px}.left .box+.box,.right .box+.box{margin-top:10px}
 .boxhead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:-14px -14px 0;padding:11px 14px;border-bottom:1px solid var(--line);background:var(--hover);border-radius:4px 4px 0 0}
 .boxhead small{font-weight:400}
 .pad{padding:10px 0 0;margin:0}.back{margin:0 0 10px;font-weight:700}
@@ -110,7 +110,7 @@ details.opt{margin:14px 0}details.opt summary{cursor:pointer;color:var(--link);f
 .tw .txt{margin-top:2px;white-space:pre-wrap;word-break:break-word;font-size:.98rem}
 .ext{display:inline-block;margin-top:3px;font-size:.9rem}
 .acts{margin-top:6px;font-size:.84rem}.acts a{color:var(--sub);font-weight:700}.acts a:hover{color:var(--link)}
-.replybar{padding:12px 14px;border-top:1px solid var(--line);margin:0 -14px -14px;background:var(--hover);border-radius:0 0 4px 4px}.list+.replybar{margin-top:0}
+.replybar{padding:12px 14px;border-top:1px solid var(--line);margin:0 -14px -14px;background:var(--hover);border-radius:0 0 4px 4px}.list+.replybar{margin-top:14px}
 .starters{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .ice{background:var(--panel);border:1px solid var(--line2);border-radius:12px;padding:3px 11px;font:inherit;font-size:.84rem;cursor:pointer;color:var(--text);text-align:left;transition:all .12s}.ice:hover{border-color:var(--blue);color:var(--link)}
 

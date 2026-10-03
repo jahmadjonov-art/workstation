@@ -249,7 +249,7 @@ async function home() {
 
 async function postPage(id) {
   const p = await api('/posts/' + id);
-  app.innerHTML = shell(`<p class="back"><a href="#/">&larr; Home</a></p><div class="box">${postRow(p, true)}</div>
+  app.innerHTML = shell(`<p class="back"><a href="#/">&larr; Home</a></p><div class="box flush">${postRow(p, true)}</div>
   <div class="box"><div class="boxhead"><h3>${p.replies.length ? `Replies (${p.replies.length})` : 'No replies yet'}</h3></div>
   <div class="list">${p.replies.map(r => `<article class="tw"><a href="#/user/${r.author.id}">${avatar(r.author, 'lg')}</a><div class="body"><div class="head"><span><a class="nm" href="#/user/${r.author.id}">${esc(r.author.name)}</a> <small>${ago(r.created)}</small></span>
     ${me ? moreMenu(r.mine ? [{ act: 'del-reply', id: r.id, label: 'Delete', danger: true }] : [{ act: 'report', kind: 'reply', id: r.id, label: 'Report reply' }, { act: 'block', id: r.author.id, name: r.author.name, label: `Block ${esc(r.author.name.split(' ')[0])}`, danger: true }]) : ''}</div>
