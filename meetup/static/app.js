@@ -4,16 +4,19 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 let meta = { categories: [], looking_for: [] };
 let me = null;
 
+const mem = new Map();  // used when the browser blocks localStorage (private mode, embedded frames)
 const store = {
-  get: k => { try { return localStorage.getItem(k); } catch { return null; } },
-  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
-  del: k => { try { localStorage.removeItem(k); } catch {} },
+  get: k => { try { return localStorage.getItem(k); } catch { return mem.get(k) ?? null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch { mem.set(k, v); } },
+  del: k => { try { localStorage.removeItem(k); } catch { mem.delete(k); } },
 };
 const token = () => store.get('huddle_token');
 const api = async (path, opts = {}) => {
   const headers = { 'Content-Type': 'application/json' };
   if (token()) headers.Authorization = 'Bearer ' + token();
-  const r = await fetch('/api' + path, { headers, ...opts, body: opts.body ? JSON.stringify(opts.body) : undefined });
+  let r;
+  try { r = await fetch('/api' + path, { headers, ...opts, body: opts.body ? JSON.stringify(opts.body) : undefined }); }
+  catch { throw new Error("Can't reach the Huddle server. Check your connection and try again."); }
   if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(typeof e.detail === 'string' ? e.detail : 'Something went wrong'); }
   return r.json();
 };
@@ -119,7 +122,7 @@ async function refreshBadge() {
 }
 setInterval(() => document.hidden || refreshBadge(), 30000);
 function renderBanner() {
-  const el = $('#banner'); if (!el) return;
+  const el = $('#banner'); if (!el || window.__DEMO) return;
   const show = me && !store.get('huddle_saved_' + me.id) && privJwk();
   el.innerHTML = show ? `<div class="banner">Save your login file so you never lose your account or messages. <button class="btn small" data-act="save-login">Save it</button></div>` : '';
 }
@@ -561,4 +564,16 @@ async function route() {
 }
 addEventListener('hashchange', route);
 $('#search').addEventListener('submit', e => { e.preventDefault(); searchQ = $('#search input').value.trim(); location.hash === '#/events' ? route() : (location.hash = '#/events'); });
-(async () => { meta = await api('/meta'); await loadMe(); route(); })();
+(async () => {
+  try { meta = await api('/meta'); }
+  catch {
+    const asFile = location.protocol === 'file:';
+    app.innerHTML = `<div class="solo"><div class="box form"><h2>Can't connect to the Huddle server</h2>
+      <p>${asFile ? 'This page was opened as a file, but Huddle needs its server running to sign you in and load events.' : 'The Huddle server isn\'t responding right now.'}</p>
+      <p class="sub">${asFile ? 'Start the server (<code>uvicorn server:app</code> in the <code>meetup</code> folder), then open <code>http://localhost:8000</code> in your browser.' : 'Check your connection, then try again.'}</p>
+      <p><button class="btn" id="retry">Try again</button></p></div></div>`;
+    $('#retry').onclick = () => location.reload();
+    return;
+  }
+  await loadMe(); route();
+})();

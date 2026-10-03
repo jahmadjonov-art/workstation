@@ -2,6 +2,15 @@
 
 A meetup site focused on connection: see who's going, what you share with them, and say hello easily. Open to everyone.
 
+## Try it without a server
+`python demo/build_demo.py` writes `demo/dist/huddle-demo.html`: one file you can double-click. It is the real
+front end talking to a pretend server inside the page (`demo/mock-backend.js`), seeded with sample people who
+have real encryption keys and answer message requests. Nothing is saved and reloading starts over. Use it to
+look around or show the site to someone.
+
+Opening `static/index.html` directly does not work, because the real site needs its server. The page now says
+so ("Can't connect to the Huddle server") instead of failing quietly.
+
 ## Run
 ```
 cd meetup

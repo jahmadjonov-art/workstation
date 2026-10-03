@@ -22,6 +22,17 @@
 <div id="banner"></div>
 <main id="app"></main>
 <div id="toast" role="status"></div>
-<script src="/static/app.js"></script>
+<script>
+  // Opened as a plain file, or the app script can't load: explain what to do instead of showing a blank page.
+  function huddleOffline() {
+    document.querySelector('.topbar').style.display = 'none';
+    document.getElementById('app').innerHTML = '<div style="max-width:520px;margin:40px auto;padding:20px;background:#fff;border:1px solid #ccd6dd;border-radius:4px;font:14px/1.5 Helvetica,Arial,sans-serif;color:#292f33">'
+      + '<h2 style="margin:0 0 8px;font-size:1.25rem">Can\'t connect to the Huddle server</h2>'
+      + '<p>This page needs its server running to sign you in and load events, so it can\'t work when opened as a file.</p>'
+      + '<p style="color:#5c6a75">To run it: open a terminal in the <code>meetup</code> folder, run <code>uvicorn server:app</code>, then visit <code>http://localhost:8000</code>. To just look around, build the no-server demo with <code>python demo/build_demo.py</code>.</p></div>';
+  }
+  if (location.protocol === 'file:') huddleOffline();
+</script>
+<script src="/static/app.js" onerror="huddleOffline()"></script>
 </body>
 </html>
