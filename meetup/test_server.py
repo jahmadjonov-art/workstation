@@ -185,3 +185,68 @@ def test_event_chat_report_and_rate_limit(c):
     mid = c.get("/api/events/1").json()["messages"][-1]["id"]
     b = Person(c, "B")
     assert c.post("/api/reports", headers=b.h, json={"kind": "event_message", "target_id": mid, "reason": "spam"}).status_code == 200
+
+
+def test_delete_account_erases_everything_but_keeps_safety_reports(c):
+    a, b = Person(c, "Ann"), Person(c, "Bo")
+    a.rsvp(1), b.rsvp(1)
+    a.dm(b, "hello"), b.dm(a, "hi back")
+    c.post("/api/posts", headers=a.h, json={"body": "my post", "tags": ["Hiking"]})
+    c.post("/api/events/1/messages", headers=a.h, json={"body": "chat msg"})
+    ev = c.post("/api/events", headers=a.h, json={"title": "Ann's walk", "description": "A short walk together", "category": "Outdoors",
+                "city": "Austin", "venue": "Park", "starts": "2099-01-01T10:00", "capacity": 5}).json()["id"]
+    key = b64(b.key_for(jwk_pub(a.priv)))
+    rid = c.post("/api/reports", headers=b.h, json={"kind": "dm", "target_id": a.id, "reason": "harassment", "key": key}).json()["id"]
+    assert c.delete("/api/me", headers=a.h).status_code == 200
+    assert c.get("/api/me", headers=a.h).status_code == 401  # session is gone
+    assert c.get(f"/api/users/{a.id}").status_code == 404
+    assert c.get(f"/api/events/{ev}").status_code == 404
+    assert c.get(f"/api/dm/{a.id}", headers=b.h).json() == []
+    assert all(m["user"]["id"] != a.id for m in c.get("/api/events/1").json()["messages"])
+    assert all(p["author"]["id"] != a.id for p in c.get("/api/posts").json())
+    assert a.id not in [u["id"] for u in c.get("/api/me/matches", headers=b.h).json()]
+    row = server.db().execute("SELECT * FROM users WHERE id=?", (a.id,)).fetchone()
+    assert row["name"] == "Deleted user" and row["public_key"] is None and row["token_hash"] is None and row["bio"] == ""
+    mod = {"X-Mod-Key": "m" * 32}
+    assert c.get(f"/api/mod/reports/{rid}", headers=mod).status_code == 200  # safety evidence retained
+
+
+def test_block_hides_content_both_ways_and_can_be_undone(c):
+    a, b = Person(c, "A"), Person(c, "B")
+    pid = c.post("/api/posts", headers=a.h, json={"body": "hello feed"}).json()["id"]
+    assert any(p["id"] == pid for p in c.get("/api/posts", headers=b.h).json())
+    c.put(f"/api/blocks/{a.id}", headers=b.h)
+    assert not any(p["id"] == pid for p in c.get("/api/posts", headers=b.h).json())
+    assert c.get(f"/api/posts/{pid}", headers=b.h).status_code == 404
+    assert [u["id"] for u in c.get("/api/blocks", headers=b.h).json()] == [a.id]
+    c.delete(f"/api/blocks/{a.id}", headers=b.h)
+    assert any(p["id"] == pid for p in c.get("/api/posts", headers=b.h).json())
+
+
+def test_feed_posting_replies_and_spam_limits(c):
+    a, b = Person(c, "A"), Person(c, "B")
+    assert c.post("/api/posts", headers=a.h, json={"body": "check https://spam.example"}).status_code == 403  # new accounts: no links
+    assert c.post("/api/posts", headers=a.h, json={"body": "ok", "url": "javascript:alert(1)"}).status_code in (400, 403)
+    pid = c.post("/api/posts", headers=a.h, json={"body": "Trail report: lovely today", "tags": ["Hiking", "hiking", "Coffee"]}).json()["id"]
+    assert c.post("/api/posts", headers=a.h, json={"body": "Trail report: lovely today"}).status_code == 400  # duplicate
+    assert c.post(f"/api/posts/{pid}/replies", headers=b.h, json={"body": "thanks!"}).status_code == 200
+    post = c.get(f"/api/posts/{pid}").json()
+    assert post["tags"] == ["Hiking", "Coffee"] and post["replies"][0]["body"] == "thanks!"
+    rid = post["replies"][0]["id"]
+    assert c.delete(f"/api/replies/{rid}", headers=a.h).status_code == 404  # only the author can delete
+    assert c.delete(f"/api/replies/{rid}", headers=b.h).status_code == 200
+    codes = [c.post("/api/posts", headers=a.h, json={"body": f"post {i}"}).status_code for i in range(5)]
+    assert 429 in codes  # new-account daily cap
+    assert c.post("/api/posts", json={"body": "anon"}).status_code == 401
+
+
+def test_profile_reports_can_message_and_post_reports(c):
+    a, b = Person(c, "A"), Person(c, "B")
+    assert c.get(f"/api/users/{b.id}", headers=a.h).json()["can_message"] is False
+    a.rsvp(1), b.rsvp(1)
+    assert c.get(f"/api/users/{b.id}", headers=a.h).json()["can_message"] is True
+    pid = c.post("/api/posts", headers=a.h, json={"body": "something bad"}).json()["id"]
+    assert c.post("/api/reports", headers=b.h, json={"kind": "post", "target_id": pid, "reason": "spam"}).status_code == 200
+    mod = {"X-Mod-Key": "m" * 32}
+    assert c.delete(f"/api/mod/posts/{pid}", headers=mod).status_code == 200
+    assert c.get(f"/api/posts/{pid}").status_code == 404

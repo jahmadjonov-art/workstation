@@ -10,11 +10,22 @@ uvicorn server:app --reload
 ```
 Open http://localhost:8000. A SQLite database (`huddle.db`) is created and seeded with sample data on first start.
 
+## What it feels like
+- **Join in under a minute**: first name, city, birthday, tap a few interests, one button. No password or email.
+  You land on events picked for you; a small banner offers to save your login file.
+- **Feed**: share news, finds and links, tagged by interest. "For you" ranks by your interests and city.
+  Reply on a post. New accounts can't post links for 24 hours (anti-spam).
+- **Message in one tap**: a Message button next to people on events and in People. Chats update live.
+- **Block in one tap** from a profile, chat, post or reply, with Undo; manage the list in Settings.
+- **Delete your account in two taps** (Settings): messages, posts, RSVPs, hosted events and keys are erased.
+  Safety reports involving the account are retained so abuse can still be investigated.
+
 ## Connection features
 - **Interest matching**: events and people ranked by what you have in common ("Best for me", People tab).
 - **Who's going**: every attendee shows shared interests with you.
 - **Icebreakers + event conversation**: RSVP'd attendees can chat, with one-tap conversation starters.
-- **Direct messages** with a shared-interest conversation starter.
+- **Direct messages** with a shared-interest conversation starter. You can message people you share an event
+  with (a deliberate safety rule; relax it in `dm_allowed()` in `server.py` if you prefer).
 - **Inclusive profiles**: optional pronouns, "looking for" goals (friends, activity partners, networking...), no gender field.
 
 ## Privacy and safety model
@@ -39,7 +50,7 @@ database access can read DMs. Both people can compare a safety number to detect 
 the browser; it automatically gets harder if sign-ups spike), plus a honeypot field, single-use signed
 challenges and per-IP limits. Event chat, RSVPs, hosting and DMs are rate-limited per account.
 
-**Accounts**: your login and private key live in the browser. Sign-up ends with an *account file* download.
+**Accounts**: your login and private key live in the browser. The *login file* (offered after sign-up and in Settings)
 It is the only way to restore your account and read old messages on a new device. Lose it and the messages are
 unrecoverable by design.
 
@@ -60,4 +71,4 @@ unrecoverable by design.
 - Add optional email or phone verification, and move rate limiting to Redis when running multiple workers.
 
 ## Tests
-`pytest -q` runs API tests covering sign-up abuse protection, ciphertext-only storage, moderator boundaries and limits.
+`pytest -q` runs API tests covering sign-up abuse protection, ciphertext-only storage, moderator boundaries, blocking, the feed, account deletion and limits.

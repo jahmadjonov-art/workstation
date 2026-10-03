@@ -4,12 +4,14 @@ import hmac
 import json
 import os
 import random
+import re
 import secrets
 import sqlite3
 import time
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -51,7 +53,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL, bio TEXT DEFAULT '',
     pronouns TEXT DEFAULT '', interests TEXT DEFAULT '[]', looking_for TEXT DEFAULT '[]',
-    created TEXT NOT NULL, public_key TEXT, token_hash TEXT, suspended INTEGER DEFAULT 0
+    created TEXT NOT NULL, public_key TEXT, token_hash TEXT, suspended INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL,
@@ -70,6 +72,14 @@ CREATE TABLE IF NOT EXISTS event_messages (
 CREATE TABLE IF NOT EXISTS dms (
     id INTEGER PRIMARY KEY, from_id INTEGER NOT NULL REFERENCES users(id),
     to_id INTEGER NOT NULL REFERENCES users(id), iv TEXT NOT NULL, ciphertext TEXT NOT NULL, created TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL,
+    url TEXT DEFAULT '', tags TEXT DEFAULT '[]', city TEXT NOT NULL, created TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS replies (
+    id INTEGER PRIMARY KEY, post_id INTEGER NOT NULL REFERENCES posts(id),
+    user_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL, created TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS blocks (
     blocker_id INTEGER NOT NULL, blocked_id INTEGER NOT NULL, PRIMARY KEY (blocker_id, blocked_id)
@@ -96,7 +106,7 @@ def migrate(conn):
         conn.execute("DROP TABLE dms")
     conn.executescript(SCHEMA)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
-    for name, ddl in [("public_key", "TEXT"), ("token_hash", "TEXT"), ("suspended", "INTEGER DEFAULT 0")]:
+    for name, ddl in [("public_key", "TEXT"), ("token_hash", "TEXT"), ("suspended", "INTEGER DEFAULT 0"), ("deleted", "INTEGER DEFAULT 0")]:
         if name not in cols:
             conn.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
 
@@ -151,11 +161,30 @@ def seed(conn):
 
 
 
+def seed_posts(conn):
+    if conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0] or not conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
+        return
+    samples = [
+        (1, "Barton Creek is flowing again after the rain. Saw a great blue heron on the sunrise loop today!", "", ["Hiking", "Photography"]),
+        (2, "Handy find: the Austin library now lends out laptops and wifi hotspots for free. Great if you're learning to code.", "https://library.austintexas.gov", ["Python"]),
+        (3, "Anyone tried Heat: Pedal to the Metal? Looking for opinions before game night on Wednesday.", "", ["Board games"]),
+        (5, "Small tip for language learners: ten minutes of speaking out loud beats an hour of flashcards.", "", ["Languages"]),
+        (6, "Lady Bird Lake trail has a new water fountain at the east end. Good news for long runs!", "", ["Running", "Cycling"]),
+        (4, "Found a lovely beginner yoga video series that doesn't require any equipment. Happy to share if anyone wants.", "", ["Yoga", "Meditation"]),
+    ]
+    for i, (uid, body, url, tags) in enumerate(samples):
+        when = (datetime.now(timezone.utc) - timedelta(hours=3 + i * 7)).isoformat(timespec="seconds")
+        conn.execute("INSERT INTO posts (user_id, body, url, tags, city, created) VALUES (?,?,?,?,?,?)", (uid, body, url, json.dumps(tags), "Austin", when))
+    conn.execute("INSERT INTO replies (post_id, user_id, body, created) VALUES (1, 6, 'Love that loop. Was it busy?', ?)", (now(),))
+    conn.commit()
+
+
 @app.on_event("startup")
 def startup():
     with db() as conn:
         migrate(conn)
         seed(conn)
+        seed_posts(conn)
 
 
 # ── Abuse protection ──────────────────────────────────────────────────────────
@@ -341,9 +370,11 @@ def get_event(eid: int, v=Depends(me_opt)):
         if not r:
             raise HTTPException(404, "Event not found")
         ev = event_dict(conn, r, v)
+        hide = hidden_users(conn, v["id"] if v else 0)
         ev["messages"] = [
             {"id": m["id"], "body": m["body"], "created": m["created"], "user": get_user(conn, m["user_id"])}
             for m in conn.execute("SELECT * FROM event_messages WHERE event_id=? ORDER BY id", (eid,))
+            if m["user_id"] not in hide
         ]
         ev["icebreakers"] = random.Random(eid).sample(ICEBREAKERS, 3)
         return ev
@@ -511,6 +542,8 @@ def update_me(u: ProfileIn, me=Depends(me_req)):
 def profile(uid: int, v=Depends(me_opt)):
     with db() as conn:
         u = get_user(conn, uid)
+        if conn.execute("SELECT deleted FROM users WHERE id=?", (uid,)).fetchone()["deleted"]:
+            raise HTTPException(404, "This account no longer exists")
         u["events"] = [
             {"id": r["id"], "title": r["title"], "starts": r["starts"], "category": r["category"]}
             for r in conn.execute(
@@ -527,6 +560,7 @@ def profile(uid: int, v=Depends(me_opt)):
                 )
             ]
             u["blocked"] = bool(conn.execute("SELECT 1 FROM blocks WHERE blocker_id=? AND blocked_id=?", (v["id"], uid)).fetchone())
+            u["can_message"] = dm_allowed(conn, v["id"], uid)[0]
         return u
 
 
@@ -536,7 +570,7 @@ def matches(me=Depends(me_req)):
     uid = me["id"]
     with db() as conn:
         out = []
-        for r in conn.execute("SELECT * FROM users WHERE id != ? AND suspended=0", (uid,)):
+        for r in conn.execute("SELECT * FROM users WHERE id != ? AND suspended=0 AND deleted=0", (uid,)):
             o = user_dict(r)
             sh = shared(me, o)
             goals = [g for g in o["looking_for"] if g in me["looking_for"]]
@@ -545,7 +579,7 @@ def matches(me=Depends(me_req)):
             ).fetchone()[0]
             score = len(sh) * 3 + len(goals) * 2 + common * 2 + (2 if o["city"].lower() == me["city"].lower() else 0)
             if sh or goals:
-                o.update(shared=sh, shared_goals=goals, events_in_common=common, score=score)
+                o.update(shared=sh, shared_goals=goals, events_in_common=common, score=score, can_message=dm_allowed(conn, uid, o["id"])[0])
                 out.append(o)
         out.sort(key=lambda x: -x["score"])
         return out[:12]
@@ -565,6 +599,33 @@ def unblock(uid: int, me=Depends(me_req)):
     with db() as conn:
         conn.execute("DELETE FROM blocks WHERE blocker_id=? AND blocked_id=?", (me["id"], uid))
         return {"ok": True}
+
+
+@app.get("/api/blocks")
+def list_blocks(me=Depends(me_req)):
+    with db() as conn:
+        return [get_user(conn, r["blocked_id"]) for r in conn.execute("SELECT blocked_id FROM blocks WHERE blocker_id=?", (me["id"],))]
+
+
+def hidden_users(conn, viewer_id):
+    """Ids whose content a viewer should not see (they blocked them, or were blocked by them)."""
+    if not viewer_id:
+        return set()
+    return {
+        r["blocked_id"] if r["blocker_id"] == viewer_id else r["blocker_id"]
+        for r in conn.execute("SELECT * FROM blocks WHERE blocker_id=? OR blocked_id=?", (viewer_id, viewer_id))
+    }
+
+
+def dm_allowed(conn, a, b):
+    """(allowed, is_new_conversation). You can message people you share an event with, or already talk to."""
+    other = conn.execute("SELECT public_key, deleted, suspended FROM users WHERE id=?", (b,)).fetchone()
+    if not other or not other["public_key"] or other["deleted"] or other["suspended"] or a == b or blocked_either_way(conn, a, b):
+        return False, False
+    if conn.execute("SELECT 1 FROM dms WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?) LIMIT 1", (a, b, b, a)).fetchone():
+        return True, False
+    met = conn.execute("SELECT 1 FROM rsvps x JOIN rsvps y ON x.event_id=y.event_id WHERE x.user_id=? AND y.user_id=? LIMIT 1", (a, b)).fetchone()
+    return bool(met), True
 
 
 def blocked_either_way(conn, a, b):
@@ -602,16 +663,11 @@ def send_dm(d: DmIn, me=Depends(me_req)):
             raise HTTPException(400, "This sample profile can't receive encrypted messages")
         if blocked_either_way(conn, me["id"], d.to_id):
             raise HTTPException(403, "You can't message this person")
-        existing = conn.execute(
-            "SELECT 1 FROM dms WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?) LIMIT 1", (me["id"], d.to_id, d.to_id, me["id"])
-        ).fetchone()
-        if not existing:
+        ok, new_convo = dm_allowed(conn, me["id"], d.to_id)
+        if not ok:
             # Safety: you can only start a conversation with someone you share an event with.
-            met = conn.execute(
-                "SELECT 1 FROM rsvps a JOIN rsvps b ON a.event_id=b.event_id WHERE a.user_id=? AND b.user_id=? LIMIT 1", (me["id"], d.to_id)
-            ).fetchone()
-            if not met:
-                raise HTTPException(403, "You can message people once you've RSVP'd to the same event")
+            raise HTTPException(403, "You can message people once you've RSVP'd to the same event")
+        if new_convo:
             limiter.check(f"dm-new:{me['id']}", 3 if is_new(me) else 15, DAY, "New-conversation limit reached for today.")
         limiter.check(f"dm-min:{me['id']}", 15, 60)
         limiter.check(f"dm-hr:{me['id']}", 60 if is_new(me) else 300, HOUR)
@@ -648,12 +704,174 @@ def thread(other: int, me=Depends(me_req)):
         ]
 
 
+# ── Delete account ────────────────────────────────────────────────────────────
+@app.delete("/api/me")
+def delete_me(me=Depends(me_req)):
+    """Erase the account: messages, posts, RSVPs, hosted events and keys. The row is scrubbed, not kept.
+    Safety reports that mention the account are retained so abuse can still be investigated."""
+    uid = me["id"]
+    with db() as conn:
+        conn.execute("DELETE FROM dms WHERE from_id=? OR to_id=?", (uid, uid))
+        conn.execute("DELETE FROM blocks WHERE blocker_id=? OR blocked_id=?", (uid, uid))
+        for e in [r["id"] for r in conn.execute("SELECT id FROM events WHERE host_id=?", (uid,))]:
+            conn.execute("DELETE FROM event_messages WHERE event_id=?", (e,))
+            conn.execute("DELETE FROM rsvps WHERE event_id=?", (e,))
+            conn.execute("DELETE FROM events WHERE id=?", (e,))
+        conn.execute("DELETE FROM event_messages WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM rsvps WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM replies WHERE user_id=? OR post_id IN (SELECT id FROM posts WHERE user_id=?)", (uid, uid))
+        conn.execute("DELETE FROM posts WHERE user_id=?", (uid,))
+        conn.execute(
+            "UPDATE users SET name='Deleted user', city='', bio='', pronouns='', interests='[]', looking_for='[]', "
+            "public_key=NULL, token_hash=NULL, deleted=1 WHERE id=?", (uid,),
+        )
+    return {"ok": True}
+
+
+# ── Feed: share news and interests ────────────────────────────────────────────
+LINK_RE = re.compile(r"https?://|www\.", re.I)
+
+
+class PostIn(BaseModel):
+    body: str = Field(min_length=1, max_length=500)
+    url: str = Field(default="", max_length=300)
+    tags: list[str] = []
+
+
+def clean_url(u):
+    u = u.strip()
+    if not u:
+        return ""
+    p = urlparse(u)
+    if p.scheme not in ("http", "https") or not p.netloc or " " in u:
+        raise HTTPException(400, "That link doesn't look right. It should start with http:// or https://")
+    return u
+
+
+def post_dict(conn, r, viewer_id=0):
+    return {
+        "id": r["id"], "body": r["body"], "url": r["url"], "tags": json.loads(r["tags"]), "city": r["city"], "created": r["created"],
+        "author": get_user(conn, r["user_id"]), "mine": r["user_id"] == viewer_id,
+        "reply_count": conn.execute("SELECT COUNT(*) FROM replies WHERE post_id=?", (r["id"],)).fetchone()[0],
+    }
+
+
+@app.get("/api/posts")
+def list_posts(scope: str = "foryou", tag: str = "", v=Depends(me_opt)):
+    with db() as conn:
+        hide = hidden_users(conn, v["id"] if v else 0)
+        rows = conn.execute(
+            "SELECT p.* FROM posts p JOIN users u ON u.id=p.user_id WHERE u.suspended=0 AND u.deleted=0 ORDER BY p.id DESC LIMIT 200"
+        ).fetchall()
+        out = []
+        for rank, r in enumerate(rows):
+            if r["user_id"] in hide:
+                continue
+            tags = json.loads(r["tags"])
+            if tag and tag.lower() not in [t.lower() for t in tags]:
+                continue
+            same_city = bool(v) and r["city"].lower() == v["city"].lower()
+            if scope == "near" and not same_city:
+                continue
+            p = post_dict(conn, r, v["id"] if v else 0)
+            overlap = len(shared(v, {"interests": tags})) if v else 0
+            p["_score"] = overlap * 3 + (2 if same_city else 0) - rank * 0.05
+            p["match"] = shared(v, {"interests": tags}) if v else []
+            out.append(p)
+        if scope == "foryou" and v:
+            out.sort(key=lambda p: -p["_score"])
+        for p in out:
+            p.pop("_score")
+        return out[:60]
+
+
+@app.post("/api/posts")
+def create_post(p: PostIn, me=Depends(me_req)):
+    body = p.body.strip()
+    if not body:
+        raise HTTPException(400, "Write something first")
+    url = clean_url(p.url)
+    if is_new(me) and (url or LINK_RE.search(body)):
+        raise HTTPException(403, "Links unlock after your first day on Huddle. It keeps spam out.")
+    limiter.check(f"post:{me['id']}", 3 if is_new(me) else 20, DAY, "You've reached today's posting limit.")
+    limiter.check(f"post-min:{me['id']}", 3, 60)
+    with db() as conn:
+        last = conn.execute("SELECT body FROM posts WHERE user_id=? ORDER BY id DESC LIMIT 1", (me["id"],)).fetchone()
+        if last and last["body"] == body:
+            raise HTTPException(400, "You already posted that")
+        cur = conn.execute(
+            "INSERT INTO posts (user_id, body, url, tags, city, created) VALUES (?,?,?,?,?,?)",
+            (me["id"], body, url, json.dumps(clean_list(p.tags, 3)), me["city"], now()),
+        )
+        return {"id": cur.lastrowid}
+
+
+@app.get("/api/posts/{pid}")
+def get_post(pid: int, v=Depends(me_opt)):
+    with db() as conn:
+        r = conn.execute("SELECT p.* FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=? AND u.suspended=0", (pid,)).fetchone()
+        vid = v["id"] if v else 0
+        hide = hidden_users(conn, vid)
+        if not r or r["user_id"] in hide:
+            raise HTTPException(404, "Post not found")
+        out = post_dict(conn, r, vid)
+        out["replies"] = [
+            {"id": x["id"], "body": x["body"], "created": x["created"], "author": get_user(conn, x["user_id"]), "mine": x["user_id"] == vid}
+            for x in conn.execute("SELECT * FROM replies WHERE post_id=? ORDER BY id", (pid,)) if x["user_id"] not in hide
+        ]
+        return out
+
+
+class ReplyIn(BaseModel):
+    body: str = Field(min_length=1, max_length=500)
+
+
+@app.post("/api/posts/{pid}/replies")
+def reply(pid: int, rp: ReplyIn, me=Depends(me_req)):
+    body = rp.body.strip()
+    if not body:
+        raise HTTPException(400, "Write something first")
+    if is_new(me) and LINK_RE.search(body):
+        raise HTTPException(403, "Links unlock after your first day on Huddle. It keeps spam out.")
+    limiter.check(f"reply-min:{me['id']}", 6, 60)
+    limiter.check(f"reply-hr:{me['id']}", 20 if is_new(me) else 120, HOUR)
+    with db() as conn:
+        p = conn.execute("SELECT user_id FROM posts WHERE id=?", (pid,)).fetchone()
+        if not p:
+            raise HTTPException(404, "Post not found")
+        if p["user_id"] in hidden_users(conn, me["id"]):
+            raise HTTPException(403, "You can't reply to this post")
+        conn.execute("INSERT INTO replies (post_id, user_id, body, created) VALUES (?,?,?,?)", (pid, me["id"], body, now()))
+        return {"ok": True}
+
+
+@app.delete("/api/posts/{pid}")
+def delete_post(pid: int, me=Depends(me_req)):
+    with db() as conn:
+        r = conn.execute("SELECT user_id FROM posts WHERE id=?", (pid,)).fetchone()
+        if not r or r["user_id"] != me["id"]:
+            raise HTTPException(404, "Post not found")
+        conn.execute("DELETE FROM replies WHERE post_id=?", (pid,))
+        conn.execute("DELETE FROM posts WHERE id=?", (pid,))
+        return {"ok": True}
+
+
+@app.delete("/api/replies/{rid}")
+def delete_reply(rid: int, me=Depends(me_req)):
+    with db() as conn:
+        r = conn.execute("SELECT user_id FROM replies WHERE id=?", (rid,)).fetchone()
+        if not r or r["user_id"] != me["id"]:
+            raise HTTPException(404, "Reply not found")
+        conn.execute("DELETE FROM replies WHERE id=?", (rid,))
+        return {"ok": True}
+
+
 # ── Reports (the only way moderators ever see DM content) ─────────────────────
 REPORT_REASONS = ["child_safety", "harassment", "spam", "scam", "other"]
 
 
 class ReportIn(BaseModel):
-    kind: str  # dm | event_message | user | event
+    kind: str  # dm | event_message | user | event | post | reply
     target_id: int
     reason: str
     details: str = Field(default="", max_length=1000)
@@ -701,6 +919,18 @@ def create_report(rep: ReportIn, me=Depends(me_req)):
             target_user = get_user(conn, rep.target_id)["id"]
             u = get_user(conn, target_user)
             evidence = {"name": u["name"], "bio": u["bio"], "interests": u["interests"]}
+        elif rep.kind == "post":
+            p = conn.execute("SELECT * FROM posts WHERE id=?", (rep.target_id,)).fetchone()
+            if not p:
+                raise HTTPException(404, "Post not found")
+            target_user = p["user_id"]
+            evidence = {"body": p["body"], "url": p["url"], "posted": p["created"]}
+        elif rep.kind == "reply":
+            p = conn.execute("SELECT * FROM replies WHERE id=?", (rep.target_id,)).fetchone()
+            if not p:
+                raise HTTPException(404, "Reply not found")
+            target_user = p["user_id"]
+            evidence = {"post_id": p["post_id"], "body": p["body"], "posted": p["created"]}
         elif rep.kind == "event":
             e = conn.execute("SELECT * FROM events WHERE id=?", (rep.target_id,)).fetchone()
             if not e:
@@ -815,6 +1045,35 @@ def mod_delete_message(mid: int, mod=Depends(mod_req)):
     with db() as conn:
         conn.execute("DELETE FROM event_messages WHERE id=?", (mid,))
     audit(mod, "delete_event_message", f"message={mid}")
+    return {"ok": True}
+
+
+@app.get("/api/mod/posts")
+def mod_posts(user_id: int = 0, limit: int = 50, mod=Depends(mod_req)):
+    audit(mod, "list_posts", f"user={user_id}")
+    with db() as conn:
+        q, args = "SELECT * FROM posts", []
+        if user_id:
+            q += " WHERE user_id=?"
+            args.append(user_id)
+        rows = conn.execute(q + " ORDER BY id DESC LIMIT ?", args + [min(max(limit, 1), 200)]).fetchall()
+        return [{**dict(r), "replies": [dict(x) for x in conn.execute("SELECT * FROM replies WHERE post_id=? ORDER BY id", (r["id"],))]} for r in rows]
+
+
+@app.delete("/api/mod/posts/{pid}")
+def mod_delete_post(pid: int, mod=Depends(mod_req)):
+    with db() as conn:
+        conn.execute("DELETE FROM replies WHERE post_id=?", (pid,))
+        conn.execute("DELETE FROM posts WHERE id=?", (pid,))
+    audit(mod, "delete_post", f"post={pid}")
+    return {"ok": True}
+
+
+@app.delete("/api/mod/replies/{rid}")
+def mod_delete_reply(rid: int, mod=Depends(mod_req)):
+    with db() as conn:
+        conn.execute("DELETE FROM replies WHERE id=?", (rid,))
+    audit(mod, "delete_reply", f"reply={rid}")
     return {"ok": True}
 
 

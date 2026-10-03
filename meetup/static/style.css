@@ -48,3 +48,24 @@ button.chip{cursor:pointer}button.chip.sel{background:var(--teal);color:#fff}
 dialog{border:1px solid var(--line);border-radius:var(--r);background:var(--card);color:var(--ink);max-width:440px;width:92%;padding:20px}
 dialog::backdrop{background:rgba(0,0,0,.5)}
 code{background:var(--line);padding:1px 6px;border-radius:6px;font-size:.85rem}
+/* v2: effortless UI */
+.row{display:flex;gap:8px}.row.between{justify-content:space-between;align-items:center}.grow{flex:1}.hidden{display:none}
+.stack{display:grid;gap:12px}
+.narrow{max-width:520px;margin:12px auto}
+.btn.small{padding:6px 12px;font-size:.85rem}.btn.big{width:100%;padding:14px;font-size:1.05rem}
+.btn.danger{background:#c62828}.btn.danger:hover{background:#a31f1f}
+.banner{background:var(--tealsoft);color:var(--ink);padding:10px 16px;display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;font-size:.92rem}
+.more{position:relative;display:inline-block}.more summary{list-style:none;cursor:pointer;padding:2px 10px;border-radius:8px;color:var(--muted);font-weight:700;user-select:none}
+.more summary::-webkit-details-marker{display:none}.more summary:hover{background:var(--line)}
+.more>div{position:absolute;right:0;top:100%;z-index:6;background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.15);min-width:170px;padding:4px;display:grid}
+.more>div button,.more>div a{background:none;border:0;text-align:left;padding:9px 12px;border-radius:8px;cursor:pointer;text-decoration:none;color:var(--ink)}
+.more>div button:hover,.more>div a:hover{background:var(--soft)}.more>div .danger{color:#c62828}
+.usermenu summary{display:flex;align-items:center;gap:8px;color:var(--ink);font-weight:600;padding:2px 6px}.usermenu .avatar{margin:0}
+.pills{display:flex;gap:8px;margin:14px 0;flex-wrap:wrap}.pill{background:var(--card);border:1px solid var(--line);border-radius:99px;padding:6px 14px;cursor:pointer;font-weight:600;color:var(--muted)}.pill.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.post .postbody{margin:6px 0;white-space:pre-wrap;word-break:break-word}.post .name{text-decoration:none}
+a.link{color:var(--teal);font-weight:600;text-decoration:none;word-break:break-all}
+.composer textarea{border:0;padding:4px;resize:vertical;outline:0}.composer{margin:14px 0}
+.opt{margin:14px 0}.opt summary{cursor:pointer;color:var(--teal);font-weight:600}
+.chat #bubbles{max-height:55vh;overflow:auto;display:flex;flex-direction:column}
+a.thread{text-decoration:none;color:inherit}a.thread:hover{background:var(--soft)}
+@media(max-width:640px){.top{gap:10px;padding:10px 14px}nav{order:3;flex-basis:100%;gap:14px;overflow-x:auto}.grid{grid-template-columns:1fr}h1{font-size:1.6rem}.hero{padding:22px}}
