@@ -8,3 +8,4 @@ venv/
 dist/
 build/
 huddle.db
+.pytest_cache/

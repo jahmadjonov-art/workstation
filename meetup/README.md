@@ -17,5 +17,47 @@ Open http://localhost:8000. A SQLite database (`huddle.db`) is created and seede
 - **Direct messages** with a shared-interest conversation starter.
 - **Inclusive profiles**: optional pronouns, "looking for" goals (friends, activity partners, networking...), no gender field.
 
-## Notes
-Sign-in is a demo: your profile id is kept in the browser (no passwords). Add real authentication before public use.
+## Privacy and safety model
+**Direct messages are end-to-end encrypted.** Each browser generates an ECDH P-256 key pair at sign-up and
+keeps the private key. A per-conversation AES-GCM key is derived from your private key and the other person's
+public key (WebCrypto). The server stores only ciphertext and holds no keys, so neither Huddle nor anyone with
+database access can read DMs. Both people can compare a safety number to detect a man-in-the-middle.
+
+**How moderation works without a backdoor**
+- A participant can *report a conversation*. Their browser decrypts and discloses that one thread's key; the
+  server verifies it against the stored ciphertext, then saves up to 100 messages as report evidence.
+  Other conversations stay private. Nothing else gives moderators DM access.
+- Event chats, profiles and events are not E2EE (they are public to attendees), so moderators can read and
+  delete them, and users are told they are reviewed.
+- Moderator API (`/api/mod/*`, see `/docs`): list/read/resolve reports (child-safety reports sorted first),
+  suspend users, read/delete event messages, read the audit log. Auth: `X-Mod-Key` header matching the
+  `HUDDLE_MOD_KEY` env var (24+ chars; the API is disabled if unset). Every call is written to an audit log.
+- Safety by design: 18+ only (birth date checked once, not stored), DMs only between people who share an
+  event, blocking, per-account limits that are tighter for accounts under 24 hours old.
+
+**Easy to join, hard to bot**: no password or email. Sign-up needs a small proof-of-work (a couple of seconds in
+the browser; it automatically gets harder if sign-ups spike), plus a honeypot field, single-use signed
+challenges and per-IP limits. Event chat, RSVPs, hosting and DMs are rate-limited per account.
+
+**Accounts**: your login and private key live in the browser. Sign-up ends with an *account file* download.
+It is the only way to restore your account and read old messages on a new device. Lose it and the messages are
+unrecoverable by design.
+
+## Configuration
+| Env var | Purpose |
+|---|---|
+| `HUDDLE_MOD_KEY` | Enables the moderator API (24+ chars) |
+| `HUDDLE_SECRET` | Signs sign-up challenges; set it so they survive restarts and multiple workers |
+| `HUDDLE_TRUST_PROXY=1` | Use `X-Forwarded-For` for the client IP, only behind a proxy you control |
+| `HUDDLE_DB` | SQLite path |
+
+## Before going public
+- Serve over HTTPS (browsers only allow WebCrypto on HTTPS or localhost).
+- The age check is a self-declaration, not verification. For stronger protection add ID or age-estimation
+  checks, plus hash-matching (e.g. NCMEC/PhotoDNA) if you ever allow image uploads.
+- If you operate in the US/EU/UK, get legal advice on child-safety reporting duties (e.g. NCMEC reporting) and
+  build a report-handling process around the moderator API.
+- Add optional email or phone verification, and move rate limiting to Redis when running multiple workers.
+
+## Tests
+`pytest -q` runs API tests covering sign-up abuse protection, ciphertext-only storage, moderator boundaries and limits.

@@ -1,11 +1,18 @@
+import base64
+import hashlib
+import hmac
 import json
 import os
 import random
+import secrets
 import sqlite3
-from datetime import datetime, timedelta, timezone
+import time
+from collections import defaultdict, deque
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -31,6 +38,8 @@ ICEBREAKERS = [
 ]
 
 
+
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -42,7 +51,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL, bio TEXT DEFAULT '',
     pronouns TEXT DEFAULT '', interests TEXT DEFAULT '[]', looking_for TEXT DEFAULT '[]',
-    created TEXT NOT NULL
+    created TEXT NOT NULL, public_key TEXT, token_hash TEXT, suspended INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL,
@@ -57,15 +66,39 @@ CREATE TABLE IF NOT EXISTS event_messages (
     id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL REFERENCES events(id),
     user_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL, created TEXT NOT NULL
 );
+-- Direct messages are end-to-end encrypted in the browser. The server only ever stores ciphertext.
 CREATE TABLE IF NOT EXISTS dms (
     id INTEGER PRIMARY KEY, from_id INTEGER NOT NULL REFERENCES users(id),
-    to_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL, created TEXT NOT NULL
+    to_id INTEGER NOT NULL REFERENCES users(id), iv TEXT NOT NULL, ciphertext TEXT NOT NULL, created TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS blocks (
+    blocker_id INTEGER NOT NULL, blocked_id INTEGER NOT NULL, PRIMARY KEY (blocker_id, blocked_id)
+);
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY, reporter_id INTEGER NOT NULL, kind TEXT NOT NULL, target_id INTEGER NOT NULL,
+    target_user_id INTEGER, reason TEXT NOT NULL, details TEXT DEFAULT '', evidence TEXT DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'open', note TEXT DEFAULT '', created TEXT NOT NULL, resolved TEXT
+);
+CREATE TABLE IF NOT EXISTS mod_audit (
+    id INTEGER PRIMARY KEY, moderator TEXT NOT NULL, action TEXT NOT NULL, detail TEXT DEFAULT '',
+    ip TEXT DEFAULT '', created TEXT NOT NULL
 );
 """
 
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def migrate(conn):
+    dm_cols = {r["name"] for r in conn.execute("PRAGMA table_info(dms)")}
+    if dm_cols and "iv" not in dm_cols:  # old plaintext DMs can't be carried over
+        conn.execute("DROP TABLE dms")
+    conn.executescript(SCHEMA)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    for name, ddl in [("public_key", "TEXT"), ("token_hash", "TEXT"), ("suspended", "INTEGER DEFAULT 0")]:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
 
 
 def seed(conn):
@@ -117,17 +150,125 @@ def seed(conn):
     conn.commit()
 
 
+
 @app.on_event("startup")
 def startup():
     with db() as conn:
-        conn.executescript(SCHEMA)
+        migrate(conn)
         seed(conn)
+
+
+# ── Abuse protection ──────────────────────────────────────────────────────────
+class Limiter:
+    """Sliding-window rate limiter (in-memory; use Redis if you run more than one process)."""
+
+    def __init__(self):
+        self.hits = defaultdict(deque)
+
+    def check(self, key, n, window, msg="You're doing that too fast. Please slow down."):
+        t = time.time()
+        q = self.hits[key]
+        while q and q[0] < t - window:
+            q.popleft()
+        if len(q) >= n:
+            raise HTTPException(429, msg)
+        q.append(t)
+
+    def clear(self):
+        self.hits.clear()
+
+
+limiter = Limiter()
+HOUR, DAY = 3600, 86400
+SECRET = (os.environ.get("HUDDLE_SECRET") or "").encode() or secrets.token_bytes(32)
+POW_BASE_BITS = 16
+POW_TTL = 600
+_used_pow = {}
+_recent_signups = deque()
+
+
+def client_ip(request: Request):
+    if os.environ.get("HUDDLE_TRUST_PROXY") == "1":
+        fwd = request.headers.get("x-forwarded-for", "")
+        if fwd:
+            return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def pow_bits():
+    """Sign-up gets costlier for bots automatically when sign-ups spike."""
+    t = time.time()
+    while _recent_signups and _recent_signups[0] < t - HOUR:
+        _recent_signups.popleft()
+    return POW_BASE_BITS + min(6, len(_recent_signups) // 25)
+
+
+def _sig(payload: str):
+    return hmac.new(SECRET, payload.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def make_challenge():
+    payload = f"{int(time.time())}.{secrets.token_hex(8)}.{pow_bits()}"
+    return {"challenge": f"{payload}.{_sig(payload)}", "bits": pow_bits()}
+
+
+def verify_pow(challenge: str, counter: str):
+    parts = challenge.split(".")
+    if len(parts) != 4 or not counter.isdigit() or len(counter) > 12:
+        raise HTTPException(400, "Invalid human check")
+    payload = ".".join(parts[:3])
+    if not hmac.compare_digest(parts[3], _sig(payload)):
+        raise HTTPException(400, "Invalid human check")
+    ts, bits = int(parts[0]), int(parts[2])
+    t = time.time()
+    if t - ts > POW_TTL:
+        raise HTTPException(400, "Human check expired, please try again")
+    for k in [k for k, v in _used_pow.items() if t - v > POW_TTL]:
+        del _used_pow[k]
+    if challenge in _used_pow:
+        raise HTTPException(400, "Human check already used")
+    digest = hashlib.sha256(f"{challenge}:{counter}".encode()).digest()
+    if 256 - int.from_bytes(digest, "big").bit_length() < bits:
+        raise HTTPException(400, "Human check failed")
+    _used_pow[challenge] = t
+
+
+def is_new(u):
+    return datetime.now(timezone.utc) - datetime.fromisoformat(u["created"]) < timedelta(hours=24)
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+def _auth(request: Request, required: bool):
+    h = request.headers.get("authorization", "")
+    if not h.startswith("Bearer "):
+        if required:
+            raise HTTPException(401, "Please sign in")
+        return None
+    th = hashlib.sha256(h[7:].encode()).hexdigest()
+    with db() as conn:
+        r = conn.execute("SELECT * FROM users WHERE token_hash=?", (th,)).fetchone()
+    if not r:
+        if required:
+            raise HTTPException(401, "Please sign in")
+        return None
+    if r["suspended"]:
+        raise HTTPException(403, "This account has been suspended")
+    return {**user_dict(r), "created": r["created"]}
+
+
+def me_req(request: Request):
+    return _auth(request, True)
+
+
+def me_opt(request: Request):
+    return _auth(request, False)
 
 
 def user_dict(r):
     return {
         "id": r["id"], "name": r["name"], "city": r["city"], "bio": r["bio"], "pronouns": r["pronouns"],
         "interests": json.loads(r["interests"]), "looking_for": json.loads(r["looking_for"]),
+        "public_key": json.loads(r["public_key"]) if r["public_key"] else None,
     }
 
 
@@ -161,7 +302,6 @@ def event_dict(conn, r, viewer=None):
         d["going"] = any(a["id"] == viewer["id"] for a in attendees)
         for a in attendees:
             a["shared"] = shared(viewer, a) if a["id"] != viewer["id"] else []
-        # how well this event fits the viewer: interest overlap with tags + people they'd click with
         d["fit"] = len(shared(viewer, {"interests": d["tags"]}))
         d["people_like_you"] = sum(1 for a in attendees if a["id"] != viewer["id"] and a["shared"])
     return d
@@ -173,9 +313,8 @@ def meta():
 
 
 @app.get("/api/events")
-def list_events(q: str = "", category: str = "", city: str = "", viewer: int = 0, sort: str = "soon"):
+def list_events(q: str = "", category: str = "", city: str = "", sort: str = "soon", v=Depends(me_opt)):
     with db() as conn:
-        v = get_user(conn, viewer) if viewer else None
         rows = conn.execute("SELECT * FROM events WHERE starts >= ? ORDER BY starts", (datetime.now().isoformat(timespec="minutes"),)).fetchall()
         out = []
         for r in rows:
@@ -196,12 +335,11 @@ def list_events(q: str = "", category: str = "", city: str = "", viewer: int = 0
 
 
 @app.get("/api/events/{eid}")
-def get_event(eid: int, viewer: int = 0):
+def get_event(eid: int, v=Depends(me_opt)):
     with db() as conn:
         r = conn.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
         if not r:
             raise HTTPException(404, "Event not found")
-        v = get_user(conn, viewer) if viewer else None
         ev = event_dict(conn, r, v)
         ev["messages"] = [
             {"id": m["id"], "body": m["body"], "created": m["created"], "user": get_user(conn, m["user_id"])}
@@ -212,7 +350,6 @@ def get_event(eid: int, viewer: int = 0):
 
 
 class EventIn(BaseModel):
-    host_id: int
     title: str = Field(min_length=3, max_length=120)
     description: str = Field(min_length=10, max_length=2000)
     category: str
@@ -221,74 +358,66 @@ class EventIn(BaseModel):
     starts: str
     capacity: int = Field(ge=2, le=500)
     tags: list[str] = []
-    vibe: str = ""
+    vibe: str = Field(default="", max_length=80)
 
 
 @app.post("/api/events")
-def create_event(e: EventIn):
+def create_event(e: EventIn, me=Depends(me_req)):
     if e.category not in CATEGORIES:
         raise HTTPException(400, "Unknown category")
     try:
         datetime.fromisoformat(e.starts)
     except ValueError:
         raise HTTPException(400, "Invalid start time")
+    limiter.check(f"host:{me['id']}", 1 if is_new(me) else 5, DAY, "New accounts can host 1 event a day; others 5.")
     with db() as conn:
-        get_user(conn, e.host_id)
         cur = conn.execute(
             "INSERT INTO events (title, description, category, city, venue, starts, capacity, host_id, tags, vibe) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (e.title, e.description, e.category, e.city, e.venue, e.starts, e.capacity, e.host_id, json.dumps(e.tags[:8]), e.vibe),
+            (e.title.strip(), e.description.strip(), e.category, e.city.strip(), e.venue.strip(), e.starts, e.capacity, me["id"], json.dumps(clean_list(e.tags, 8)), e.vibe.strip()),
         )
-        conn.execute("INSERT INTO rsvps VALUES (?,?)", (cur.lastrowid, e.host_id))
+        conn.execute("INSERT INTO rsvps VALUES (?,?)", (cur.lastrowid, me["id"]))
         return {"id": cur.lastrowid}
 
 
-class RsvpIn(BaseModel):
-    user_id: int
-
-
 @app.post("/api/events/{eid}/rsvp")
-def rsvp(eid: int, body: RsvpIn):
+def rsvp(eid: int, me=Depends(me_req)):
+    limiter.check(f"rsvp:{me['id']}", 10 if is_new(me) else 60, DAY, "RSVP limit reached for today.")
     with db() as conn:
         r = conn.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
         if not r:
             raise HTTPException(404, "Event not found")
-        get_user(conn, body.user_id)
         count = conn.execute("SELECT COUNT(*) FROM rsvps WHERE event_id=?", (eid,)).fetchone()[0]
-        already = conn.execute("SELECT 1 FROM rsvps WHERE event_id=? AND user_id=?", (eid, body.user_id)).fetchone()
+        already = conn.execute("SELECT 1 FROM rsvps WHERE event_id=? AND user_id=?", (eid, me["id"])).fetchone()
         if not already and count >= r["capacity"]:
             raise HTTPException(409, "This event is full")
-        conn.execute("INSERT OR IGNORE INTO rsvps VALUES (?,?)", (eid, body.user_id))
+        conn.execute("INSERT OR IGNORE INTO rsvps VALUES (?,?)", (eid, me["id"]))
         return {"ok": True}
 
 
-@app.delete("/api/events/{eid}/rsvp/{uid}")
-def cancel_rsvp(eid: int, uid: int):
+@app.delete("/api/events/{eid}/rsvp")
+def cancel_rsvp(eid: int, me=Depends(me_req)):
     with db() as conn:
-        conn.execute("DELETE FROM rsvps WHERE event_id=? AND user_id=?", (eid, uid))
+        conn.execute("DELETE FROM rsvps WHERE event_id=? AND user_id=?", (eid, me["id"]))
         return {"ok": True}
 
 
 class MsgIn(BaseModel):
-    user_id: int
     body: str = Field(min_length=1, max_length=1000)
 
 
 @app.post("/api/events/{eid}/messages")
-def post_message(eid: int, m: MsgIn):
+def post_message(eid: int, m: MsgIn, me=Depends(me_req)):
+    limiter.check(f"emsg-min:{me['id']}", 8, 60)
+    limiter.check(f"emsg-hr:{me['id']}", 30 if is_new(me) else 120, HOUR)
     with db() as conn:
-        if not conn.execute("SELECT 1 FROM rsvps WHERE event_id=? AND user_id=?", (eid, m.user_id)).fetchone():
+        if not conn.execute("SELECT 1 FROM rsvps WHERE event_id=? AND user_id=?", (eid, me["id"])).fetchone():
             raise HTTPException(403, "RSVP to join the conversation")
-        conn.execute("INSERT INTO event_messages (event_id,user_id,body,created) VALUES (?,?,?,?)", (eid, m.user_id, m.body.strip(), now()))
+        body = m.body.strip()
+        last = conn.execute("SELECT body FROM event_messages WHERE event_id=? AND user_id=? ORDER BY id DESC LIMIT 1", (eid, me["id"])).fetchone()
+        if last and last["body"] == body:
+            raise HTTPException(400, "You already posted that")
+        conn.execute("INSERT INTO event_messages (event_id,user_id,body,created) VALUES (?,?,?,?)", (eid, me["id"], body, now()))
         return {"ok": True}
-
-
-class UserIn(BaseModel):
-    name: str = Field(min_length=1, max_length=60)
-    city: str = Field(min_length=2, max_length=80)
-    bio: str = Field(default="", max_length=400)
-    pronouns: str = Field(default="", max_length=30)
-    interests: list[str] = []
-    looking_for: list[str] = []
 
 
 def clean_list(xs, n):
@@ -301,35 +430,85 @@ def clean_list(xs, n):
     return out[:n]
 
 
-@app.post("/api/users")
-def create_user(u: UserIn):
+class ProfileIn(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    city: str = Field(min_length=2, max_length=80)
+    bio: str = Field(default="", max_length=400)
+    pronouns: str = Field(default="", max_length=30)
+    interests: list[str] = []
+    looking_for: list[str] = []
+
+
+class PowIn(BaseModel):
+    challenge: str
+    counter: str
+
+
+class SignupIn(ProfileIn):
+    birth_date: str  # used once to confirm 18+, never stored
+    public_key: dict  # ECDH P-256 public JWK, generated in the browser
+    pow: PowIn
+    website: str = ""  # honeypot: real users never fill this in
+
+
+def valid_pubkey(k):
+    return (
+        k.get("kty") == "EC" and k.get("crv") == "P-256" and "d" not in k
+        and all(isinstance(k.get(f), str) and 40 <= len(k[f]) <= 50 for f in ("x", "y"))
+    )
+
+
+@app.get("/api/pow")
+def get_pow(request: Request):
+    limiter.check(f"pow:{client_ip(request)}", 30, HOUR)
+    return make_challenge()
+
+
+@app.post("/api/signup")
+def signup(u: SignupIn, request: Request):
+    ip = client_ip(request)
+    if u.website:  # bot filled the hidden field; pretend it worked
+        raise HTTPException(400, "Could not create account")
+    limiter.check(f"signup-h:{ip}", 5, HOUR, "Too many sign-ups from your network. Try again later.")
+    limiter.check(f"signup-d:{ip}", 15, DAY, "Too many sign-ups from your network. Try again later.")
+    try:
+        born = date.fromisoformat(u.birth_date)
+    except ValueError:
+        raise HTTPException(400, "Enter a valid birth date")
+    today = date.today()
+    if today.year - born.year - ((today.month, today.day) < (born.month, born.day)) < 18:
+        raise HTTPException(403, "Huddle is for adults aged 18 and over")
+    if not valid_pubkey(u.public_key):
+        raise HTTPException(400, "Invalid encryption key")
+    verify_pow(u.pow.challenge, u.pow.counter)
+    token = secrets.token_urlsafe(32)
     with db() as conn:
         cur = conn.execute(
-            "INSERT INTO users (name, city, bio, pronouns, interests, looking_for, created) VALUES (?,?,?,?,?,?,?)",
-            (u.name.strip(), u.city.strip(), u.bio.strip(), u.pronouns.strip(), json.dumps(clean_list(u.interests, 12)), json.dumps(clean_list(u.looking_for, 6)), now()),
+            "INSERT INTO users (name, city, bio, pronouns, interests, looking_for, created, public_key, token_hash) VALUES (?,?,?,?,?,?,?,?,?)",
+            (u.name.strip(), u.city.strip(), u.bio.strip(), u.pronouns.strip(), json.dumps(clean_list(u.interests, 12)),
+             json.dumps(clean_list(u.looking_for, 6)), now(), json.dumps(u.public_key), hashlib.sha256(token.encode()).hexdigest()),
         )
-        return get_user(conn, cur.lastrowid)
+        _recent_signups.append(time.time())
+        return {"user": get_user(conn, cur.lastrowid), "token": token}
 
 
-@app.put("/api/users/{uid}")
-def update_user(uid: int, u: UserIn):
+@app.get("/api/me")
+def whoami(me=Depends(me_req)):
+    return me
+
+
+@app.put("/api/me")
+def update_me(u: ProfileIn, me=Depends(me_req)):
     with db() as conn:
-        get_user(conn, uid)
         conn.execute(
             "UPDATE users SET name=?, city=?, bio=?, pronouns=?, interests=?, looking_for=? WHERE id=?",
-            (u.name.strip(), u.city.strip(), u.bio.strip(), u.pronouns.strip(), json.dumps(clean_list(u.interests, 12)), json.dumps(clean_list(u.looking_for, 6)), uid),
+            (u.name.strip(), u.city.strip(), u.bio.strip(), u.pronouns.strip(), json.dumps(clean_list(u.interests, 12)), json.dumps(clean_list(u.looking_for, 6)), me["id"]),
         )
-        return get_user(conn, uid)
-
-
-@app.get("/api/users")
-def list_users():
-    with db() as conn:
-        return [user_dict(r) for r in conn.execute("SELECT * FROM users ORDER BY id")]
+        return get_user(conn, me["id"])
 
 
 @app.get("/api/users/{uid}")
-def profile(uid: int, viewer: int = 0):
+def profile(uid: int, v=Depends(me_opt)):
     with db() as conn:
         u = get_user(conn, uid)
         u["events"] = [
@@ -339,25 +518,25 @@ def profile(uid: int, viewer: int = 0):
                 (uid, datetime.now().isoformat(timespec="minutes")),
             )
         ]
-        if viewer and viewer != uid:
-            v = get_user(conn, viewer)
+        if v and v["id"] != uid:
             u["shared"] = shared(v, u)
             u["shared_events"] = [
                 r["title"] for r in conn.execute(
                     "SELECT e.title FROM events e JOIN rsvps a ON a.event_id=e.id AND a.user_id=? "
-                    "JOIN rsvps b ON b.event_id=e.id AND b.user_id=?", (uid, viewer)
+                    "JOIN rsvps b ON b.event_id=e.id AND b.user_id=?", (uid, v["id"])
                 )
             ]
+            u["blocked"] = bool(conn.execute("SELECT 1 FROM blocks WHERE blocker_id=? AND blocked_id=?", (v["id"], uid)).fetchone())
         return u
 
 
-@app.get("/api/users/{uid}/matches")
-def matches(uid: int):
+@app.get("/api/me/matches")
+def matches(me=Depends(me_req)):
     """People you may click with: shared interests + shared goals + same city + events in common."""
+    uid = me["id"]
     with db() as conn:
-        me = get_user(conn, uid)
         out = []
-        for r in conn.execute("SELECT * FROM users WHERE id != ?", (uid,)):
+        for r in conn.execute("SELECT * FROM users WHERE id != ? AND suspended=0", (uid,)):
             o = user_dict(r)
             sh = shared(me, o)
             goals = [g for g in o["looking_for"] if g in me["looking_for"]]
@@ -372,27 +551,78 @@ def matches(uid: int):
         return out[:12]
 
 
-class DmIn(BaseModel):
-    from_id: int
-    to_id: int
-    body: str = Field(min_length=1, max_length=1000)
-
-
-@app.post("/api/dm")
-def send_dm(d: DmIn):
+# ── Blocks ────────────────────────────────────────────────────────────────────
+@app.put("/api/blocks/{uid}")
+def block(uid: int, me=Depends(me_req)):
     with db() as conn:
-        get_user(conn, d.from_id)
-        get_user(conn, d.to_id)
-        if d.from_id == d.to_id:
-            raise HTTPException(400, "Can't message yourself")
-        conn.execute("INSERT INTO dms (from_id,to_id,body,created) VALUES (?,?,?,?)", (d.from_id, d.to_id, d.body.strip(), now()))
+        get_user(conn, uid)
+        conn.execute("INSERT OR IGNORE INTO blocks VALUES (?,?)", (me["id"], uid))
         return {"ok": True}
 
 
-@app.get("/api/inbox/{uid}")
-def inbox(uid: int):
+@app.delete("/api/blocks/{uid}")
+def unblock(uid: int, me=Depends(me_req)):
     with db() as conn:
-        get_user(conn, uid)
+        conn.execute("DELETE FROM blocks WHERE blocker_id=? AND blocked_id=?", (me["id"], uid))
+        return {"ok": True}
+
+
+def blocked_either_way(conn, a, b):
+    return bool(conn.execute(
+        "SELECT 1 FROM blocks WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)", (a, b, b, a)
+    ).fetchone())
+
+
+# ── End-to-end encrypted direct messages ──────────────────────────────────────
+# The browser derives a shared AES-GCM key from ECDH(my private key, their public key).
+# The server stores only (iv, ciphertext) and has no key, so it cannot read any DM.
+class DmIn(BaseModel):
+    to_id: int
+    iv: str = Field(max_length=64)
+    ciphertext: str = Field(min_length=8, max_length=8000)
+
+
+def _b64_ok(s):
+    try:
+        base64.b64decode(s, validate=True)
+        return True
+    except Exception:
+        return False
+
+
+@app.post("/api/dm")
+def send_dm(d: DmIn, me=Depends(me_req)):
+    if d.to_id == me["id"]:
+        raise HTTPException(400, "Can't message yourself")
+    if not (_b64_ok(d.iv) and _b64_ok(d.ciphertext)):
+        raise HTTPException(400, "Malformed message")
+    with db() as conn:
+        other = get_user(conn, d.to_id)
+        if not other["public_key"]:
+            raise HTTPException(400, "This sample profile can't receive encrypted messages")
+        if blocked_either_way(conn, me["id"], d.to_id):
+            raise HTTPException(403, "You can't message this person")
+        existing = conn.execute(
+            "SELECT 1 FROM dms WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?) LIMIT 1", (me["id"], d.to_id, d.to_id, me["id"])
+        ).fetchone()
+        if not existing:
+            # Safety: you can only start a conversation with someone you share an event with.
+            met = conn.execute(
+                "SELECT 1 FROM rsvps a JOIN rsvps b ON a.event_id=b.event_id WHERE a.user_id=? AND b.user_id=? LIMIT 1", (me["id"], d.to_id)
+            ).fetchone()
+            if not met:
+                raise HTTPException(403, "You can message people once you've RSVP'd to the same event")
+            limiter.check(f"dm-new:{me['id']}", 3 if is_new(me) else 15, DAY, "New-conversation limit reached for today.")
+        limiter.check(f"dm-min:{me['id']}", 15, 60)
+        limiter.check(f"dm-hr:{me['id']}", 60 if is_new(me) else 300, HOUR)
+        conn.execute("INSERT INTO dms (from_id,to_id,iv,ciphertext,created) VALUES (?,?,?,?,?)", (me["id"], d.to_id, d.iv, d.ciphertext, now()))
+        return {"ok": True}
+
+
+@app.get("/api/inbox")
+def inbox(me=Depends(me_req)):
+    uid = me["id"]
+    with db() as conn:
         rows = conn.execute("SELECT * FROM dms WHERE from_id=? OR to_id=? ORDER BY id DESC", (uid, uid)).fetchall()
         seen, threads = set(), []
         for r in rows:
@@ -400,19 +630,198 @@ def inbox(uid: int):
             if other in seen:
                 continue
             seen.add(other)
-            threads.append({"user": get_user(conn, other), "last": r["body"], "created": r["created"], "mine": r["from_id"] == uid})
+            if blocked_either_way(conn, uid, other):
+                continue
+            threads.append({"user": get_user(conn, other), "iv": r["iv"], "ciphertext": r["ciphertext"], "created": r["created"], "mine": r["from_id"] == uid})
         return threads
 
 
-@app.get("/api/dm/{uid}/{other}")
-def thread(uid: int, other: int):
+@app.get("/api/dm/{other}")
+def thread(other: int, me=Depends(me_req)):
+    uid = me["id"]
     with db() as conn:
         return [
-            {"id": r["id"], "from_id": r["from_id"], "body": r["body"], "created": r["created"]}
+            {"id": r["id"], "from_id": r["from_id"], "iv": r["iv"], "ciphertext": r["ciphertext"], "created": r["created"]}
             for r in conn.execute(
                 "SELECT * FROM dms WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?) ORDER BY id", (uid, other, other, uid)
             )
         ]
+
+
+# ── Reports (the only way moderators ever see DM content) ─────────────────────
+REPORT_REASONS = ["child_safety", "harassment", "spam", "scam", "other"]
+
+
+class ReportIn(BaseModel):
+    kind: str  # dm | event_message | user | event
+    target_id: int
+    reason: str
+    details: str = Field(default="", max_length=1000)
+    key: str = ""  # dm only: base64 of the pair's AES key, which the reporter chooses to disclose
+
+
+def decrypt_thread(conn, a, b, key_b64):
+    try:
+        key = base64.b64decode(key_b64, validate=True)
+        aes = AESGCM(key)
+    except Exception:
+        raise HTTPException(400, "Invalid conversation key")
+    rows = conn.execute(
+        "SELECT * FROM dms WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?) ORDER BY id DESC LIMIT 100", (a, b, b, a)
+    ).fetchall()
+    if not rows:
+        raise HTTPException(400, "There are no messages to report")
+    out = []
+    for r in reversed(rows):
+        try:
+            text = aes.decrypt(base64.b64decode(r["iv"]), base64.b64decode(r["ciphertext"]), None).decode()
+        except Exception:
+            raise HTTPException(400, "That key does not match this conversation")
+        out.append({"from_id": r["from_id"], "text": text, "sent": r["created"]})
+    return out
+
+
+@app.post("/api/reports")
+def create_report(rep: ReportIn, me=Depends(me_req)):
+    if rep.reason not in REPORT_REASONS:
+        raise HTTPException(400, "Unknown reason")
+    limiter.check(f"report:{me['id']}", 20, DAY, "Report limit reached for today.")
+    with db() as conn:
+        target_user, evidence = None, {}
+        if rep.kind == "dm":
+            target_user = get_user(conn, rep.target_id)["id"]
+            evidence = {"messages": decrypt_thread(conn, me["id"], target_user, rep.key)}
+        elif rep.kind == "event_message":
+            m = conn.execute("SELECT * FROM event_messages WHERE id=?", (rep.target_id,)).fetchone()
+            if not m:
+                raise HTTPException(404, "Message not found")
+            target_user = m["user_id"]
+            evidence = {"event_id": m["event_id"], "body": m["body"], "posted": m["created"]}
+        elif rep.kind == "user":
+            target_user = get_user(conn, rep.target_id)["id"]
+            u = get_user(conn, target_user)
+            evidence = {"name": u["name"], "bio": u["bio"], "interests": u["interests"]}
+        elif rep.kind == "event":
+            e = conn.execute("SELECT * FROM events WHERE id=?", (rep.target_id,)).fetchone()
+            if not e:
+                raise HTTPException(404, "Event not found")
+            target_user = e["host_id"]
+            evidence = {"title": e["title"], "description": e["description"], "venue": e["venue"]}
+        else:
+            raise HTTPException(400, "Unknown report type")
+        if target_user == me["id"]:
+            raise HTTPException(400, "You can't report yourself")
+        cur = conn.execute(
+            "INSERT INTO reports (reporter_id, kind, target_id, target_user_id, reason, details, evidence, created) VALUES (?,?,?,?,?,?,?,?)",
+            (me["id"], rep.kind, rep.target_id, target_user, rep.reason, rep.details.strip(), json.dumps(evidence), now()),
+        )
+        return {"id": cur.lastrowid}
+
+
+# ── Moderator API ─────────────────────────────────────────────────────────────
+# Authenticated with HUDDLE_MOD_KEY (X-Mod-Key header). Moderators can read public content and
+# reports. They can NOT read DMs: the server has no keys. Every call is written to an audit log.
+def mod_req(request: Request):
+    key = os.environ.get("HUDDLE_MOD_KEY", "")
+    if len(key) < 24:
+        raise HTTPException(503, "Moderator API is disabled (set HUDDLE_MOD_KEY, 24+ characters)")
+    limiter.check(f"mod-auth:{client_ip(request)}", 60, 60, "Too many requests")
+    if not hmac.compare_digest(request.headers.get("x-mod-key", "").encode(), key.encode()):
+        raise HTTPException(401, "Invalid moderator key")
+    return {"name": request.headers.get("x-mod-name", "moderator")[:60], "ip": client_ip(request)}
+
+
+def audit(mod, action, detail=""):
+    with db() as conn:
+        conn.execute("INSERT INTO mod_audit (moderator, action, detail, ip, created) VALUES (?,?,?,?,?)", (mod["name"], action, detail, mod["ip"], now()))
+
+
+@app.get("/api/mod/reports")
+def mod_reports(status: str = "open", reason: str = "", limit: int = 50, mod=Depends(mod_req)):
+    audit(mod, "list_reports", f"status={status} reason={reason}")
+    with db() as conn:
+        q, args = "SELECT id, reporter_id, kind, target_user_id, reason, status, created FROM reports WHERE status=?", [status]
+        if reason:
+            q += " AND reason=?"
+            args.append(reason)
+        # child-safety reports first
+        q += " ORDER BY (reason='child_safety') DESC, id DESC LIMIT ?"
+        args.append(min(max(limit, 1), 200))
+        return [dict(r) for r in conn.execute(q, args)]
+
+
+@app.get("/api/mod/reports/{rid}")
+def mod_report(rid: int, mod=Depends(mod_req)):
+    with db() as conn:
+        r = conn.execute("SELECT * FROM reports WHERE id=?", (rid,)).fetchone()
+        if not r:
+            raise HTTPException(404, "Report not found")
+        audit(mod, "read_report", f"report={rid} kind={r['kind']}")
+        d = dict(r)
+        d["evidence"] = json.loads(d["evidence"])
+        d["reporter"] = get_user(conn, r["reporter_id"])
+        d["target_user"] = get_user(conn, r["target_user_id"]) if r["target_user_id"] else None
+        return d
+
+
+class ResolveIn(BaseModel):
+    action: str  # dismiss | actioned
+    note: str = Field(default="", max_length=1000)
+    suspend_user: bool = False
+
+
+@app.post("/api/mod/reports/{rid}/resolve")
+def mod_resolve(rid: int, body: ResolveIn, mod=Depends(mod_req)):
+    if body.action not in ("dismiss", "actioned"):
+        raise HTTPException(400, "action must be dismiss or actioned")
+    with db() as conn:
+        r = conn.execute("SELECT * FROM reports WHERE id=?", (rid,)).fetchone()
+        if not r:
+            raise HTTPException(404, "Report not found")
+        conn.execute("UPDATE reports SET status=?, note=?, resolved=? WHERE id=?", ("dismissed" if body.action == "dismiss" else "actioned", body.note, now(), rid))
+        if body.suspend_user and r["target_user_id"]:
+            conn.execute("UPDATE users SET suspended=1 WHERE id=?", (r["target_user_id"],))
+    audit(mod, "resolve_report", f"report={rid} action={body.action} suspend={body.suspend_user}")
+    return {"ok": True}
+
+
+@app.post("/api/mod/users/{uid}/suspend")
+def mod_suspend(uid: int, mod=Depends(mod_req)):
+    with db() as conn:
+        get_user(conn, uid)
+        conn.execute("UPDATE users SET suspended=1 WHERE id=?", (uid,))
+    audit(mod, "suspend_user", f"user={uid}")
+    return {"ok": True}
+
+
+@app.post("/api/mod/users/{uid}/unsuspend")
+def mod_unsuspend(uid: int, mod=Depends(mod_req)):
+    with db() as conn:
+        get_user(conn, uid)
+        conn.execute("UPDATE users SET suspended=0 WHERE id=?", (uid,))
+    audit(mod, "unsuspend_user", f"user={uid}")
+    return {"ok": True}
+
+
+@app.get("/api/mod/events/{eid}/messages")
+def mod_event_messages(eid: int, mod=Depends(mod_req)):
+    audit(mod, "read_event_messages", f"event={eid}")
+    with db() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM event_messages WHERE event_id=? ORDER BY id", (eid,))]
+
+
+@app.delete("/api/mod/event-messages/{mid}")
+def mod_delete_message(mid: int, mod=Depends(mod_req)):
+    with db() as conn:
+        conn.execute("DELETE FROM event_messages WHERE id=?", (mid,))
+    audit(mod, "delete_event_message", f"message={mid}")
+    return {"ok": True}
+
+
+@app.get("/api/mod/audit")
+def mod_audit_log(limit: int = 100, mod=Depends(mod_req)):
+    with db() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM mod_audit ORDER BY id DESC LIMIT ?", (min(max(limit, 1), 500),))]
 
 
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
