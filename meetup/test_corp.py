@@ -185,9 +185,10 @@ def test_invite_flow_grants_the_key_and_lets_a_new_member_read(c):
 
 def test_invite_rules_expiry_limits_and_revocation(c):
     a = company(c)
-    assert c.get("/api/corp/invites/bad").status_code == 404
+    assert c.post("/api/corp/invites/peek", json={"token": "badbadbadbad"}).status_code == 404
+    assert c.get(f"/api/corp/invites/anything").status_code in (404, 405)  # tokens never go in URLs
     t = a.invite("member", max_uses=1)
-    assert c.get(f"/api/corp/invites/{t}").json() == {"workspace": "Northwind", "role": "member"}
+    assert c.post("/api/corp/invites/peek", json={"token": t}).json() == {"workspace": "Northwind", "role": "member"}
     P(c, "One", token=t)
     assert P(c, "Two", token=t).resp.status_code == 404  # single use
     t2 = a.invite("member")
@@ -376,5 +377,5 @@ def test_one_account_can_belong_to_several_workspaces(c):
     assert c.get(f"/api/corp/w/{r.json()['workspace_id']}", headers=b.h).status_code == 404
     # a person can join a second company with the same account
     t = P(c, "Cy", company="Cy Co").invite("member")
-    assert t and c.post(f"/api/corp/invites/{t}/accept", headers=a.h).status_code == 200
+    assert t and c.post("/api/corp/invites/accept", headers=a.h, json={"token": t}).status_code == 200
     assert len(c.get("/api/corp/me", headers=a.h).json()["workspaces"]) == 3

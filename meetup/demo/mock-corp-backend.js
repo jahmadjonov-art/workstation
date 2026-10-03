@@ -200,12 +200,12 @@
   R('GET', '/w/:wid/invites', ({ params, me }) => { needRole(needMember(+params.wid, me.id), 'admin'); return db.invites.filter(i => i.workspace_id === +params.wid).reverse().map(({ token, ...i }) => i); });
   R('DELETE', '/w/:wid/invites/:iid', ({ params, me }) => { needRole(needMember(+params.wid, me.id), 'admin'); const i = db.invites.find(x => x.id === +params.iid); if (i) i.revoked = true; return { ok: true }; });
   const liveInvite = t => { const i = db.invites.find(x => x.token === t); if (!i || i.revoked || i.uses >= i.max_uses || i.expires < nowIso()) fail(404, "This invite link isn't valid any more. Ask your admin for a new one."); return i; };
-  R('GET', '/invites/:token', ({ params }) => { const i = liveInvite(params.token); return { workspace: db.workspaces.find(w => w.id === i.workspace_id).name, role: i.role }; }, false);
+  R('POST', '/invites/peek', ({ body: b }) => { const i = liveInvite(b.token); return { workspace: db.workspaces.find(w => w.id === i.workspace_id).name, role: i.role }; }, false);
   R('POST', '/join', ({ body: b }) => {
     if (b.website) fail(400, 'Could not create account'); const i = liveInvite(b.token), [u, token] = newUser(b.name, b.title, b.public_key);
     addMember(i.workspace_id, u.id, i.role, b.title, i.new_hire); i.uses++; audit(i.workspace_id, u.id, 'member_joined', `role=${i.role}`); return { token, user_id: u.id, workspace_id: i.workspace_id };
   }, false);
-  R('POST', '/invites/:token/accept', ({ params, me }) => { const i = liveInvite(params.token); if (!mem(i.workspace_id, me.id)) { addMember(i.workspace_id, me.id, i.role, me.title, i.new_hire); i.uses++; } return { workspace_id: i.workspace_id }; });
+  R('POST', '/invites/accept', ({ body: b, me }) => { const i = liveInvite(b.token); if (!mem(i.workspace_id, me.id)) { addMember(i.workspace_id, me.id, i.role, me.title, i.new_hire); i.uses++; } return { workspace_id: i.workspace_id }; });
 
   R('GET', '/w/:wid', ({ params, me }) => {
     const wid = +params.wid, m = needMember(wid, me.id), w = db.workspaces.find(x => x.id === wid);

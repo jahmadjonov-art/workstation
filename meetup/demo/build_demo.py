@@ -89,7 +89,7 @@ def corp_payload():
 
 def landing_parts():
     html = read(STATIC / "landing.html")
-    css = re.search(r"<style>(.*?)</style>", html, re.S).group(1)
+    css = read(STATIC / "landing.css")
     markup = html.split("<body>")[1].split("</body>")[0]
     markup = markup.replace('href="/huddle"', 'href="#" data-go="huddle"').replace('href="/corp"', 'href="#" data-go="corp"')
     return css, markup

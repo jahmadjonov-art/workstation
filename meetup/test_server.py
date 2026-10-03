@@ -207,7 +207,7 @@ def test_report_dm_reveals_only_that_thread_and_mods_cannot_read_dms(c):
     assert [m["text"] for m in det["evidence"]["messages"]] == ["reported content", "reply"]
     assert "unrelated private chat" not in json.dumps(det)
     # no mod endpoint exposes raw DMs
-    assert all("dm" not in route.path for route in server.app.routes if route.path.startswith("/api/mod"))
+    assert all("dm" not in getattr(route, "path", "") for route in server.app.routes if getattr(route, "path", "").startswith("/api/mod"))
     assert c.post(f"/api/mod/reports/{r.json()['id']}/resolve", headers=mod, json={"action": "actioned", "suspend_user": True}).status_code == 200
     assert c.get("/api/me", headers=a.h).status_code == 403  # suspended
     log = c.get("/api/mod/audit", headers=mod).json()

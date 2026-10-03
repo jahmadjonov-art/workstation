@@ -266,11 +266,15 @@ def build(h):
             raise HTTPException(404, "This invite link isn't valid any more. Ask your admin for a new one.")
         return inv
 
-    @router.get("/invites/{token}")
-    def peek_invite(token: str, request: Request):
+    class TokenIn(BaseModel):
+        token: str = Field(min_length=10, max_length=120)
+
+    # The token travels in the request body, never the URL, so it can't end up in server or proxy logs.
+    @router.post("/invites/peek")
+    def peek_invite(b: TokenIn, request: Request):
         limiter.check(f"corp-peek:{h.client_ip(request)}", 30, h.HOUR)
         with db() as conn:
-            inv = live_invite(conn, token)
+            inv = live_invite(conn, b.token)
             w = conn.execute("SELECT name FROM corp_workspaces WHERE id=?", (inv["workspace_id"],)).fetchone()
             return {"workspace": w["name"], "role": inv["role"]}
 
@@ -288,11 +292,12 @@ def build(h):
             audit(conn, inv["workspace_id"], uid, "member_joined", f"role={inv['role']}")
             return {"token": token, "user_id": uid, "workspace_id": inv["workspace_id"]}
 
-    @router.post("/invites/{token}/accept")
-    def accept_invite(token: str, u=Depends(corp_me)):
+    @router.post("/invites/accept")
+    def accept_invite(b: TokenIn, request: Request, u=Depends(corp_me)):
         """An existing account joins another workspace."""
+        limiter.check(f"corp-accept:{h.client_ip(request)}", 30, h.HOUR)
         with db() as conn:
-            inv = live_invite(conn, token)
+            inv = live_invite(conn, b.token)
             if conn.execute("SELECT 1 FROM corp_members WHERE workspace_id=? AND user_id=?", (inv["workspace_id"], u["id"])).fetchone():
                 return {"workspace_id": inv["workspace_id"]}
             add_to_workspace(conn, inv["workspace_id"], u["id"], inv["role"], u["title"], new_hire=bool(inv["new_hire"]))

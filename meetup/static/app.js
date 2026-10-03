@@ -1,3 +1,4 @@
+window.__appLoaded = true;
 const $ = (s, r = document) => r.querySelector(s);
 const app = $('#app');
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));

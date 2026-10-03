@@ -30,6 +30,7 @@
   }
   if (location.protocol === 'file:') corpOffline();
 </script>
-<script src="/static/corp.js" onerror="corpOffline()"></script>
+<script src="/static/corp.js"></script>
+<script>if (!window.__appLoaded) corpOffline();</script>
 </body>
 </html>

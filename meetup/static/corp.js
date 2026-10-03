@@ -1,4 +1,5 @@
 /* Huddle Corp front end. Plain JavaScript, no build step. Encryption lives in crypto.js. */
+window.__appLoaded = true;
 const $ = (s, r = document) => r.querySelector(s);
 const app = $('#app');
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -271,11 +272,11 @@ async function loginPage() {
 
 async function joinPage(tokenStr) {
   let inv;
-  try { inv = await api(`/invites/${encodeURIComponent(tokenStr)}`); }
+  try { inv = await api('/invites/peek', { method: 'POST', body: { token: tokenStr } }); }
   catch (e) { app.innerHTML = `<div class="solo"><div class="box"><h2>This invite isn't valid</h2><p class="sub">${esc(e.message)}</p></div></div>`; return; }
   if (me) {  // already have an account: just add this workspace
     app.innerHTML = `<div class="solo"><div class="box form"><h2>Join ${esc(inv.workspace)}</h2><p class="sub">You will join as ${esc(inv.role)}, signed in as ${esc(me.user.name)}.</p><p><button class="btn big" id="go">Join workspace</button></p></div></div>`;
-    $('#go').onclick = async () => { try { const r = await api(`/invites/${encodeURIComponent(tokenStr)}/accept`, { method: 'POST' }); await loadMe(); await loadWorkspace(r.workspace_id); renderTop(); toast('You have joined'); location.hash = '#/'; } catch (e) { toast(e.message); } };
+    $('#go').onclick = async () => { try { const r = await api('/invites/accept', { method: 'POST', body: { token: tokenStr } }); await loadMe(); await loadWorkspace(r.workspace_id); renderTop(); toast('You have joined'); location.hash = '#/'; } catch (e) { toast(e.message); } };
     return;
   }
   app.innerHTML = `<div class="solo"><div class="box form"><h2>Join ${esc(inv.workspace)}</h2><p class="sub">You are invited as ${esc(inv.role)}. Your keys are created in this browser.</p>
@@ -749,7 +750,7 @@ const navFor = h => (NAV.map(n => n[0]).concat('#/settings').filter(p => p !== '
 addEventListener('hashchange', route);
 setInterval(() => document.hidden || !W || keepKeysFlowing().catch(() => {}), 12000);  // hand out and renew keys in the background
 (async () => {
-  try { await loadMe(); } catch { app.innerHTML = '<div class="solo"><div class="box form"><h2>Can\'t connect to Huddle Corp</h2><p>Check your connection, then try again.</p><p><button class="btn" onclick="location.reload()">Try again</button></p></div></div>'; return; }
+  try { await loadMe(); } catch { app.innerHTML = '<div class="solo"><div class="box form"><h2>Can\'t connect to Huddle Corp</h2><p>Check your connection, then try again.</p><p><button class="btn" id="retry">Try again</button></p></div></div>'; $('#retry').onclick = () => location.reload(); return; }
   if (W) { try { await keepKeysFlowing(); } catch {} }
   route();
 })();

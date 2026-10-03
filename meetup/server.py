@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
@@ -28,7 +28,8 @@ from pydantic import BaseModel, Field
 BASE = Path(__file__).parent
 DB_PATH = os.environ.get("HUDDLE_DB", str(BASE / "huddle.db"))
 
-app = FastAPI(title="Huddle")
+DOCS_ON = os.environ.get("HUDDLE_DOCS") == "1"
+app = FastAPI(title="Huddle", docs_url="/docs" if DOCS_ON else None, redoc_url=None, openapi_url="/openapi.json" if DOCS_ON else None)
 
 CATEGORIES = [
     "Outdoors", "Tech", "Food & Drink", "Arts & Culture", "Games", "Sports & Fitness",
@@ -53,6 +54,62 @@ def db():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+# ── Browser protections, request size limits, and a coarse per-network flood limit ──
+MAX_JSON_BODY = 1_000_000
+MAX_UPLOAD_BODY = 45 * 1024 * 1024  # a 40 MB video plus form overhead
+FLOOD_PER_MINUTE = 3000             # generous: an office behind one address must still work
+
+
+def _inline_script_hashes():
+    """The few pages that carry a tiny inline 'can't connect' script are allowed by hash, nothing else inline."""
+    out = []
+    for page in ("index.html", "corp.html"):
+        try:
+            html = (BASE / "static" / page).read_text()
+        except OSError:
+            continue
+        for body in re.findall(r"<script>(.*?)</script>", html, re.S):
+            out.append("'sha256-" + base64.b64encode(hashlib.sha256(body.encode()).digest()).decode() + "'")
+    return " ".join(out)
+
+
+def page_csp():
+    return ("default-src 'none'; script-src 'self' " + _inline_script_hashes() + "; style-src 'self'; style-src-attr 'unsafe-inline'; "
+            "img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; font-src 'self'; manifest-src 'self'; "
+            "base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; worker-src 'none'")
+
+
+@app.middleware("http")
+async def protect(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/"):
+        try:
+            limiter.check(f"flood:{client_ip(request)}", FLOOD_PER_MINUTE, 60, "Too many requests from your network. Please slow down.")
+        except HTTPException as e:
+            return JSONResponse({"detail": e.detail}, status_code=429)
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            if "chunked" in request.headers.get("transfer-encoding", "").lower():
+                return JSONResponse({"detail": "Length required"}, status_code=411)
+            cl = request.headers.get("content-length", "0")
+            if cl.isdigit() and int(cl) > (MAX_UPLOAD_BODY if path == "/api/media" else MAX_JSON_BODY):
+                return JSONResponse({"detail": "That request is too large"}, status_code=413)
+    resp = await call_next(request)
+    h = resp.headers
+    h["X-Content-Type-Options"] = "nosniff"
+    h["Referrer-Policy"] = "no-referrer"
+    h["X-Frame-Options"] = "DENY"
+    h["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+    h["Cross-Origin-Opener-Policy"] = "same-origin"
+    if os.environ.get("HUDDLE_HSTS") == "1":
+        h["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    if path.startswith("/api/"):
+        h["Cache-Control"] = "no-store"  # responses hold private data; never let a browser or proxy keep them
+    elif "text/html" in h.get("content-type", ""):
+        h["Content-Security-Policy"] = page_csp()
+        h["Cache-Control"] = "no-cache"
+    return resp
 
 
 SCHEMA = """
@@ -236,6 +293,7 @@ def seed_posts(conn):
 def startup():
     with db() as conn:
         migrate(conn)
+        prune_orphans(conn)
         conn.executescript(_corp.SCHEMA)
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(corp_invites)")}
         if "new_hire" not in cols:
@@ -249,22 +307,36 @@ def startup():
 
 # ── Abuse protection ──────────────────────────────────────────────────────────
 class Limiter:
-    """Sliding-window rate limiter (in-memory; use Redis if you run more than one process)."""
+    """Sliding-window rate limiter (in-memory; use Redis if you run more than one process).
+    Old entries are swept regularly so a flood of one-off visitors can't make it grow without bound."""
 
     def __init__(self):
         self.hits = defaultdict(deque)
+        self.windows = {}
+        self.calls = 0
 
     def check(self, key, n, window, msg="You're doing that too fast. Please slow down."):
         t = time.time()
+        self.calls += 1
+        if self.calls % 2000 == 0:
+            self.sweep(t)
         q = self.hits[key]
+        self.windows[key] = max(window, self.windows.get(key, 0))
         while q and q[0] < t - window:
             q.popleft()
         if len(q) >= n:
             raise HTTPException(429, msg)
         q.append(t)
 
+    def sweep(self, t=None):
+        t = t or time.time()
+        for k in [k for k, q in self.hits.items() if not q or q[-1] < t - self.windows.get(k, 0)]:
+            self.hits.pop(k, None)
+            self.windows.pop(k, None)
+
     def clear(self):
         self.hits.clear()
+        self.windows.clear()
 
 
 limiter = Limiter()
@@ -460,6 +532,7 @@ def create_event(e: EventIn, me=Depends(me_req)):
         datetime.fromisoformat(e.starts)
     except ValueError:
         raise HTTPException(400, "Invalid start time")
+    no_links_if_new(me, e.title, e.description, e.venue, e.vibe, " ".join(e.tags))
     limiter.check(f"host:{me['id']}", 1 if is_new(me) else 5, DAY, "New accounts can host 1 event a day; others 5.")
     with db() as conn:
         cur = conn.execute(
@@ -498,6 +571,7 @@ class MsgIn(BaseModel):
 
 @app.post("/api/events/{eid}/messages")
 def post_message(eid: int, m: MsgIn, me=Depends(me_req)):
+    no_links_if_new(me, m.body)
     limiter.check(f"emsg-min:{me['id']}", 8, 60)
     limiter.check(f"emsg-hr:{me['id']}", 30 if is_new(me) else 120, HOUR)
     with db() as conn:
@@ -560,6 +634,8 @@ def signup(u: SignupIn, request: Request):
     ip = client_ip(request)
     if u.website:  # bot filled the hidden field; pretend it worked
         raise HTTPException(400, "Could not create account")
+    if any(LINK_RE.search(t or "") for t in (u.name, u.city, u.bio, u.pronouns, " ".join(u.interests))):
+        raise HTTPException(400, "Names and bios can't contain links")
     limiter.check(f"signup-h:{ip}", 5, HOUR, "Too many sign-ups from your network. Try again later.")
     limiter.check(f"signup-d:{ip}", 15, DAY, "Too many sign-ups from your network. Try again later.")
     try:
@@ -596,6 +672,7 @@ def whoami(me=Depends(me_req)):
 
 @app.put("/api/me")
 def update_me(u: ProfileIn, me=Depends(me_req)):
+    no_links_if_new(me, u.name, u.city, u.bio, u.pronouns, " ".join(u.interests))
     with db() as conn:
         conn.execute(
             "UPDATE users SET name=?, city=?, bio=?, pronouns=?, interests=?, looking_for=? WHERE id=?",
@@ -878,6 +955,7 @@ UPLOAD_DIR = Path(os.environ.get("HUDDLE_UPLOADS", str(BASE / "uploads")))
 MAX_IMAGE, MAX_VIDEO, MAX_PIXELS = 8 * 1024 * 1024, 40 * 1024 * 1024, 40_000_000
 SCAN_URL = os.environ.get("HUDDLE_MEDIA_SCAN_URL", "")
 FFMPEG = shutil.which("ffmpeg")
+MAX_USER_BYTES = 500 * 1024 * 1024  # stored media per person
 MEDIA_NAME_RE = re.compile(r"^[a-f0-9]{32}\.(webp|mp4|webm)$")
 MEDIA_TYPES = {"webp": "image/webp", "mp4": "video/mp4", "webm": "video/webm"}
 Image.MAX_IMAGE_PIXELS = MAX_PIXELS
@@ -918,7 +996,9 @@ def process_video(data: bytes, ext: str):
     with tempfile.TemporaryDirectory() as d:
         src, dst = Path(d) / f"in.{ext}", Path(d) / f"out.{ext}"
         src.write_bytes(data)
-        cmd = [FFMPEG, "-y", "-v", "error", "-i", str(src), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-map_metadata", "-1"]
+        # force the demuxer for the format we already verified, so ffmpeg never guesses (playlists, concat files, URLs)
+        cmd = [FFMPEG, "-nostdin", "-y", "-v", "error", "-protocol_whitelist", "file", "-f", "mov" if ext == "mp4" else "matroska", "-i", str(src),
+               "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-map_metadata", "-1"]
         cmd += ["-movflags", "+faststart"] if ext == "mp4" else []
         try:
             res = subprocess.run(cmd + [str(dst)], capture_output=True, timeout=90)
@@ -934,6 +1014,8 @@ def scan_media(data: bytes, kind: str):
     The scanner must answer {"allowed": true}. If it is configured but unreachable, uploads fail closed."""
     if not SCAN_URL:
         return
+    if urlparse(SCAN_URL).scheme not in ("http", "https"):
+        raise HTTPException(503, "Upload check is misconfigured")
     import urllib.request
     req = urllib.request.Request(SCAN_URL, data=data, method="POST", headers={"Content-Type": "application/octet-stream", "X-Media-Kind": kind})
     try:
@@ -967,6 +1049,10 @@ def upload_media(file: UploadFile = File(...), me=Depends(me_req)):
             raise HTTPException(403, "Videos unlock after your first day on Huddle. Photos are fine now.")
         out, ext, mkind = process_video(data, kind), kind, "video"
     scan_media(out, mkind)
+    with db() as conn:
+        prune_orphans(conn)
+        if conn.execute("SELECT COALESCE(SUM(bytes), 0) FROM media WHERE user_id=?", (me["id"],)).fetchone()[0] + len(out) > MAX_USER_BYTES:
+            raise HTTPException(413, "You've used all of your photo and video storage. Delete some posts to free space.")
     name = f"{secrets.token_hex(16)}.{ext}"
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     (UPLOAD_DIR / name).write_bytes(out)
@@ -990,6 +1076,12 @@ def serve_media(name: str):
     return FileResponse(UPLOAD_DIR / name, media_type=MEDIA_TYPES[name.rsplit(".", 1)[1]], headers={
         "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox",
         "Cross-Origin-Resource-Policy": "same-origin", "Cache-Control": "private, max-age=3600"})
+
+
+def prune_orphans(conn):
+    """Uploads that were never attached to a post are removed after a day, so abandoned drafts don't fill the disk."""
+    old = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
+    drop_media(conn, conn.execute("SELECT id, name FROM media WHERE post_id IS NULL AND created < ?", (old,)).fetchall())
 
 
 def drop_media(conn, rows):
@@ -1077,6 +1169,7 @@ def list_groups(scope: str = "discover", q: str = "", v=Depends(me_opt)):
 def create_group(g: GroupIn, me=Depends(me_req)):
     if g.mature and not me["show_mature"]:
         raise HTTPException(403, "Turn on 18+ groups in Settings before creating one.")
+    no_links_if_new(me, g.name, g.description, g.city, " ".join(g.tags))
     limiter.check(f"group:{me['id']}", 1 if is_new(me) else 3, DAY, "You can create 1 group a day at first, then 3.")
     with db() as conn:
         cur = conn.execute(
@@ -1175,7 +1268,7 @@ def set_prefs(p: PrefsIn, me=Depends(me_req)):
 
 
 # ── Feed: photos, videos and news, with comments, likes and reposts ───────────
-LINK_RE = re.compile(r"https?://|www\.", re.I)
+LINK_RE = re.compile(r"https?://|www\.|\b[a-z0-9-]{2,}\.(?:com|net|org|io|co|me|ly|gg|xyz|ru|cn|info|biz|app|dev|link|click|top|site|online|shop)\b", re.I)
 
 
 class PostIn(BaseModel):
@@ -1186,6 +1279,12 @@ class PostIn(BaseModel):
     media: list[int] = []
 
 
+def no_links_if_new(me, *texts):
+    """Brand-new accounts can't put links anywhere. It's the cheapest, most effective spam stop there is."""
+    if is_new(me) and any(LINK_RE.search(t or "") for t in texts):
+        raise HTTPException(403, "Links unlock after your first day on Huddle. It keeps spam out.")
+
+
 def clean_url(u):
     u = u.strip()
     if not u:
@@ -1193,6 +1292,8 @@ def clean_url(u):
     p = urlparse(u)
     if p.scheme not in ("http", "https") or not p.netloc or " " in u:
         raise HTTPException(400, "That link doesn't look right. It should start with http:// or https://")
+    if p.username or p.password or "@" in p.netloc:  # https://yourbank.com@evil.site is a classic phishing trick
+        raise HTTPException(400, "Links can't contain a username or password")
     return u
 
 
@@ -1519,6 +1620,7 @@ def mod_req(request: Request):
         raise HTTPException(503, "Moderator API is disabled (set HUDDLE_MOD_KEY, 24+ characters)")
     limiter.check(f"mod-auth:{client_ip(request)}", 60, 60, "Too many requests")
     if not hmac.compare_digest(request.headers.get("x-mod-key", "").encode(), key.encode()):
+        limiter.check(f"mod-fail:{client_ip(request)}", 8, HOUR, "Too many wrong keys. Locked out for an hour.")
         raise HTTPException(401, "Invalid moderator key")
     return {"name": request.headers.get("x-mod-name", "moderator")[:60], "ip": client_ip(request)}
 

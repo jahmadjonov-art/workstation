@@ -34,6 +34,7 @@
   }
   if (location.protocol === 'file:') huddleOffline();
 </script>
-<script src="/static/app.js" onerror="huddleOffline()"></script>
+<script src="/static/app.js"></script>
+<script>if (!window.__appLoaded) huddleOffline();</script>
 </body>
 </html>
