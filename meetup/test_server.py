@@ -106,22 +106,71 @@ def test_actions_need_auth_and_cannot_impersonate(c):
     assert c.get("/api/me", headers={"Authorization": "Bearer nope"}).status_code == 401
 
 
-def test_dm_is_ciphertext_only_and_needs_shared_event(c):
+def test_dm_is_ciphertext_only_and_starts_as_request(c):
     a, b = Person(c, "Ann"), Person(c, "Bo")
-    assert a.dm(b, "hi").status_code == 403  # haven't met
-    a.rsvp(1), b.rsvp(1)
-    assert a.dm(b, "secret plans").status_code == 200
-    raw = open(server.DB_PATH, "rb").read()
-    assert b"secret plans" not in raw
+    r = a.dm(b, "secret plans")  # strangers can send ONE message, as a request
+    assert r.status_code == 200 and r.json()["status"] == "pending"
+    assert a.dm(b, "are you there?").status_code == 403  # no pestering while pending
+    assert b"secret plans" not in open(server.DB_PATH, "rb").read()
     rows = c.get(f"/api/dm/{a.id}", headers=b.h).json()
     assert len(rows) == 1 and "secret plans" not in json.dumps(rows)
     key = b.key_for(jwk_pub(a.priv))
     assert AESGCM(key).decrypt(ub64(rows[0]["iv"]), ub64(rows[0]["ciphertext"]), None) == b"secret plans"
 
 
+def test_request_accept_flow_and_counts(c):
+    a, b = Person(c, "Ann"), Person(c, "Bo")
+    a.dm(b, "hi!")
+    assert c.get("/api/me/counts", headers=b.h).json() == {"requests": 1}
+    assert c.get("/api/me/counts", headers=a.h).json() == {"requests": 0}
+    assert c.get("/api/inbox", headers=b.h).json()[0]["status"] == "request_in"
+    assert c.get("/api/inbox", headers=a.h).json()[0]["status"] == "request_out"
+    assert c.get(f"/api/users/{a.id}", headers=b.h).json()["chat"] == "request_in"
+    assert c.post(f"/api/requests/{b.id}/accept", headers=b.h).status_code == 404  # only the recipient can accept
+    assert c.post(f"/api/requests/{a.id}/accept", headers=b.h).status_code == 200
+    assert c.get("/api/me/counts", headers=b.h).json() == {"requests": 0}
+    assert a.dm(b, "great, hello").status_code == 200 and b.dm(a, "hey!").status_code == 200
+    assert c.get("/api/inbox", headers=a.h).json()[0]["status"] == "accepted"
+
+
+def test_replying_to_a_request_accepts_it(c):
+    a, b = Person(c, "Ann"), Person(c, "Bo")
+    a.dm(b, "hi")
+    assert b.dm(a, "hello back").json()["status"] == "accepted"
+    assert a.dm(b, "nice").status_code == 200
+
+
+def test_decline_is_silent_permanent_and_hidden(c):
+    a, b = Person(c, "Ann"), Person(c, "Bo")
+    a.dm(b, "hi")
+    assert c.post(f"/api/requests/{a.id}/decline", headers=b.h).status_code == 200
+    assert c.get("/api/inbox", headers=b.h).json() == []  # gone for the recipient
+    assert c.get("/api/me/counts", headers=b.h).json() == {"requests": 0}
+    assert c.get("/api/inbox", headers=a.h).json()[0]["status"] == "request_out"  # sender isn't told
+    assert a.dm(b, "please?").status_code == 403
+    assert b.dm(a, "actually, hi").status_code == 200  # the recipient can still open the chat themselves
+    assert a.dm(b, "thanks!").status_code == 200
+
+
+def test_request_can_be_reported_before_accepting(c):
+    a, b = Person(c, "Ann"), Person(c, "Bo")
+    a.dm(b, "inappropriate opener")
+    key = b64(b.key_for(jwk_pub(a.priv)))
+    r = c.post("/api/reports", headers=b.h, json={"kind": "dm", "target_id": a.id, "reason": "harassment", "key": key})
+    assert r.status_code == 200
+    det = c.get(f"/api/mod/reports/{r.json()['id']}", headers={"X-Mod-Key": "m" * 32}).json()
+    assert det["evidence"]["messages"][0]["text"] == "inappropriate opener"
+
+
+def test_blocked_users_cannot_send_requests(c):
+    a, b = Person(c, "Ann"), Person(c, "Bo")
+    c.put(f"/api/blocks/{a.id}", headers=b.h)
+    assert a.dm(b, "hi").status_code == 403
+    assert c.get(f"/api/users/{b.id}", headers=a.h).json()["chat"] == "unavailable"
+
+
 def test_cannot_dm_demo_profile_without_key(c):
     a = Person(c)
-    a.rsvp(1)
     r = c.post("/api/dm", headers=a.h, json={"to_id": 1, "iv": "AAAAAAAAAAAAAAAA", "ciphertext": "AAAAAAAA"})
     assert r.status_code == 400
 
@@ -129,25 +178,18 @@ def test_cannot_dm_demo_profile_without_key(c):
 def test_new_account_new_conversation_cap(c):
     a = Person(c)
     others = [Person(c, f"o{i}") for i in range(4)]
-    a.rsvp(1)
-    codes = []
-    for o in others:
-        o.rsvp(1)
-        codes.append(a.dm(o, "hello").status_code)
+    codes = [a.dm(o, "hello").status_code for o in others]
     assert codes == [200, 200, 200, 429]
 
 
 def test_block_stops_messages(c):
     a, b = Person(c, "A"), Person(c, "B")
-    a.rsvp(1), b.rsvp(1)
     assert c.put(f"/api/blocks/{a.id}", headers=b.h).status_code == 200
     assert a.dm(b, "hey").status_code == 403
 
 
 def test_report_dm_reveals_only_that_thread_and_mods_cannot_read_dms(c):
     a, b, x = Person(c, "A"), Person(c, "B"), Person(c, "X")
-    for p in (a, b, x):
-        p.rsvp(1)
     a.dm(b, "reported content"), b.dm(a, "reply"), a.dm(x, "unrelated private chat")
     mod = {"X-Mod-Key": "m" * 32, "X-Mod-Name": "alice"}
     key = b64(b.key_for(jwk_pub(a.priv)))
@@ -189,7 +231,6 @@ def test_event_chat_report_and_rate_limit(c):
 
 def test_delete_account_erases_everything_but_keeps_safety_reports(c):
     a, b = Person(c, "Ann"), Person(c, "Bo")
-    a.rsvp(1), b.rsvp(1)
     a.dm(b, "hello"), b.dm(a, "hi back")
     c.post("/api/posts", headers=a.h, json={"body": "my post", "tags": ["Hiking"]})
     c.post("/api/events/1/messages", headers=a.h, json={"body": "chat msg"})
@@ -240,11 +281,13 @@ def test_feed_posting_replies_and_spam_limits(c):
     assert c.post("/api/posts", json={"body": "anon"}).status_code == 401
 
 
-def test_profile_reports_can_message_and_post_reports(c):
+def test_profile_chat_state_and_post_reports(c):
     a, b = Person(c, "A"), Person(c, "B")
-    assert c.get(f"/api/users/{b.id}", headers=a.h).json()["can_message"] is False
-    a.rsvp(1), b.rsvp(1)
+    assert c.get(f"/api/users/{b.id}", headers=a.h).json()["chat"] == "none"
     assert c.get(f"/api/users/{b.id}", headers=a.h).json()["can_message"] is True
+    a.dm(b, "hello")
+    assert c.get(f"/api/users/{b.id}", headers=a.h).json()["chat"] == "request_out"
+    assert c.get(f"/api/users/{a.id}", headers=b.h).json()["chat"] == "request_in"
     pid = c.post("/api/posts", headers=a.h, json={"body": "something bad"}).json()["id"]
     assert c.post("/api/reports", headers=b.h, json={"kind": "post", "target_id": pid, "reason": "spam"}).status_code == 200
     mod = {"X-Mod-Key": "m" * 32}

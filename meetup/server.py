@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS replies (
     id INTEGER PRIMARY KEY, post_id INTEGER NOT NULL REFERENCES posts(id),
     user_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL, created TEXT NOT NULL
 );
+-- One row per pair of people who have messaged. A first message starts as a 'pending' request;
+-- it becomes 'accepted' when the recipient accepts or replies, or 'declined' (silent to the sender).
+CREATE TABLE IF NOT EXISTS convos (
+    user_a INTEGER NOT NULL, user_b INTEGER NOT NULL, requester_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', created TEXT NOT NULL, updated TEXT NOT NULL,
+    PRIMARY KEY (user_a, user_b)
+);
 CREATE TABLE IF NOT EXISTS blocks (
     blocker_id INTEGER NOT NULL, blocked_id INTEGER NOT NULL, PRIMARY KEY (blocker_id, blocked_id)
 );
@@ -105,6 +112,10 @@ def migrate(conn):
     if dm_cols and "iv" not in dm_cols:  # old plaintext DMs can't be carried over
         conn.execute("DROP TABLE dms")
     conn.executescript(SCHEMA)
+    conn.execute(
+        "INSERT OR IGNORE INTO convos SELECT min(from_id,to_id) AS a, max(from_id,to_id) AS b, min(from_id,to_id), 'accepted', min(created), max(created) "
+        "FROM dms GROUP BY a, b"
+    )
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
     for name, ddl in [("public_key", "TEXT"), ("token_hash", "TEXT"), ("suspended", "INTEGER DEFAULT 0"), ("deleted", "INTEGER DEFAULT 0")]:
         if name not in cols:
@@ -560,7 +571,8 @@ def profile(uid: int, v=Depends(me_opt)):
                 )
             ]
             u["blocked"] = bool(conn.execute("SELECT 1 FROM blocks WHERE blocker_id=? AND blocked_id=?", (v["id"], uid)).fetchone())
-            u["can_message"] = dm_allowed(conn, v["id"], uid)[0]
+            u["chat"] = chat_state(conn, v["id"], uid)
+            u["can_message"] = u["chat"] != "unavailable"
         return u
 
 
@@ -579,7 +591,7 @@ def matches(me=Depends(me_req)):
             ).fetchone()[0]
             score = len(sh) * 3 + len(goals) * 2 + common * 2 + (2 if o["city"].lower() == me["city"].lower() else 0)
             if sh or goals:
-                o.update(shared=sh, shared_goals=goals, events_in_common=common, score=score, can_message=dm_allowed(conn, uid, o["id"])[0])
+                o.update(shared=sh, shared_goals=goals, events_in_common=common, score=score, chat=(st := chat_state(conn, uid, o["id"])), can_message=st != "unavailable")
                 out.append(o)
         out.sort(key=lambda x: -x["score"])
         return out[:12]
@@ -617,15 +629,20 @@ def hidden_users(conn, viewer_id):
     }
 
 
-def dm_allowed(conn, a, b):
-    """(allowed, is_new_conversation). You can message people you share an event with, or already talk to."""
-    other = conn.execute("SELECT public_key, deleted, suspended FROM users WHERE id=?", (b,)).fetchone()
-    if not other or not other["public_key"] or other["deleted"] or other["suspended"] or a == b or blocked_either_way(conn, a, b):
-        return False, False
-    if conn.execute("SELECT 1 FROM dms WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?) LIMIT 1", (a, b, b, a)).fetchone():
-        return True, False
-    met = conn.execute("SELECT 1 FROM rsvps x JOIN rsvps y ON x.event_id=y.event_id WHERE x.user_id=? AND y.user_id=? LIMIT 1", (a, b)).fetchone()
-    return bool(met), True
+def chat_state(conn, me, other):
+    """unavailable | none | request_out | request_in | accepted, from `me`'s point of view.
+    A declined request still reads as request_out to the sender, so declining is silent."""
+    o = conn.execute("SELECT public_key, deleted, suspended FROM users WHERE id=?", (other,)).fetchone()
+    if not o or me == other or not o["public_key"] or o["deleted"] or o["suspended"] or blocked_either_way(conn, me, other):
+        return "unavailable"
+    c = conn.execute("SELECT * FROM convos WHERE user_a=? AND user_b=?", (min(me, other), max(me, other))).fetchone()
+    if not c:
+        return "none"
+    if c["status"] == "accepted":
+        return "accepted"
+    if c["requester_id"] == me:
+        return "request_out"
+    return "request_in" if c["status"] == "pending" else "none"
 
 
 def blocked_either_way(conn, a, b):
@@ -653,7 +670,8 @@ def _b64_ok(s):
 
 @app.post("/api/dm")
 def send_dm(d: DmIn, me=Depends(me_req)):
-    if d.to_id == me["id"]:
+    uid = me["id"]
+    if d.to_id == uid:
         raise HTTPException(400, "Can't message yourself")
     if not (_b64_ok(d.iv) and _b64_ok(d.ciphertext)):
         raise HTTPException(400, "Malformed message")
@@ -661,18 +679,64 @@ def send_dm(d: DmIn, me=Depends(me_req)):
         other = get_user(conn, d.to_id)
         if not other["public_key"]:
             raise HTTPException(400, "This sample profile can't receive encrypted messages")
-        if blocked_either_way(conn, me["id"], d.to_id):
+        st = chat_state(conn, uid, d.to_id)
+        pair = (min(uid, d.to_id), max(uid, d.to_id))
+        if st == "unavailable":
             raise HTTPException(403, "You can't message this person")
-        ok, new_convo = dm_allowed(conn, me["id"], d.to_id)
-        if not ok:
-            # Safety: you can only start a conversation with someone you share an event with.
-            raise HTTPException(403, "You can message people once you've RSVP'd to the same event")
-        if new_convo:
-            limiter.check(f"dm-new:{me['id']}", 3 if is_new(me) else 15, DAY, "New-conversation limit reached for today.")
-        limiter.check(f"dm-min:{me['id']}", 15, 60)
-        limiter.check(f"dm-hr:{me['id']}", 60 if is_new(me) else 300, HOUR)
-        conn.execute("INSERT INTO dms (from_id,to_id,iv,ciphertext,created) VALUES (?,?,?,?,?)", (me["id"], d.to_id, d.iv, d.ciphertext, now()))
+        if st == "request_out":
+            raise HTTPException(403, "Your request is waiting. You can keep chatting once they accept.")
+        limiter.check(f"dm-min:{uid}", 15, 60)
+        limiter.check(f"dm-hr:{uid}", 60 if is_new(me) else 300, HOUR)
+        status = "accepted"
+        if st == "none":
+            existing = conn.execute("SELECT 1 FROM convos WHERE user_a=? AND user_b=?", pair).fetchone()
+            if existing:  # I had declined their request; writing to them now opens the chat
+                conn.execute("UPDATE convos SET status='accepted', updated=? WHERE user_a=? AND user_b=?", (now(), *pair))
+            else:
+                limiter.check(f"dm-new:{uid}", 3 if is_new(me) else 15, DAY, "You've sent a lot of requests today. Try again tomorrow.")
+                if conn.execute("SELECT COUNT(*) FROM convos WHERE requester_id=? AND status='pending'", (uid,)).fetchone()[0] >= 20:
+                    raise HTTPException(429, "You have many requests waiting. Wait for replies before sending more.")
+                conn.execute("INSERT INTO convos VALUES (?,?,?,?,?,?)", (*pair, uid, "pending", now(), now()))
+                status = "pending"
+        elif st == "request_in":  # replying to a request accepts it
+            conn.execute("UPDATE convos SET status='accepted', updated=? WHERE user_a=? AND user_b=?", (now(), *pair))
+        else:
+            conn.execute("UPDATE convos SET updated=? WHERE user_a=? AND user_b=?", (now(), *pair))
+        conn.execute("INSERT INTO dms (from_id,to_id,iv,ciphertext,created) VALUES (?,?,?,?,?)", (uid, d.to_id, d.iv, d.ciphertext, now()))
+        return {"ok": True, "status": status}
+
+
+def _request_row(conn, me_id, requester_id):
+    c = conn.execute("SELECT * FROM convos WHERE user_a=? AND user_b=?", (min(me_id, requester_id), max(me_id, requester_id))).fetchone()
+    if not c or c["requester_id"] != requester_id or requester_id == me_id or c["status"] != "pending":
+        raise HTTPException(404, "Request not found")
+
+
+@app.post("/api/requests/{uid}/accept")
+def accept_request(uid: int, me=Depends(me_req)):
+    with db() as conn:
+        _request_row(conn, me["id"], uid)
+        conn.execute("UPDATE convos SET status='accepted', updated=? WHERE user_a=? AND user_b=?", (now(), min(me["id"], uid), max(me["id"], uid)))
         return {"ok": True}
+
+
+@app.post("/api/requests/{uid}/decline")
+def decline_request(uid: int, me=Depends(me_req)):
+    """Silent: the sender keeps seeing 'request sent' and can't send again."""
+    with db() as conn:
+        _request_row(conn, me["id"], uid)
+        conn.execute("UPDATE convos SET status='declined', updated=? WHERE user_a=? AND user_b=?", (now(), min(me["id"], uid), max(me["id"], uid)))
+        return {"ok": True}
+
+
+@app.get("/api/me/counts")
+def counts(me=Depends(me_req)):
+    with db() as conn:
+        n = sum(
+            1 for r in conn.execute("SELECT * FROM convos WHERE (user_a=? OR user_b=?) AND status='pending' AND requester_id!=?", (me["id"],) * 3)
+            if chat_state(conn, me["id"], r["requester_id"]) == "request_in"
+        )
+        return {"requests": n}
 
 
 @app.get("/api/inbox")
@@ -686,9 +750,10 @@ def inbox(me=Depends(me_req)):
             if other in seen:
                 continue
             seen.add(other)
-            if blocked_either_way(conn, uid, other):
+            st = chat_state(conn, uid, other)
+            if st in ("unavailable", "none"):  # blocked, deleted, or a request I declined
                 continue
-            threads.append({"user": get_user(conn, other), "iv": r["iv"], "ciphertext": r["ciphertext"], "created": r["created"], "mine": r["from_id"] == uid})
+            threads.append({"user": get_user(conn, other), "iv": r["iv"], "ciphertext": r["ciphertext"], "created": r["created"], "mine": r["from_id"] == uid, "status": st})
         return threads
 
 
@@ -713,6 +778,7 @@ def delete_me(me=Depends(me_req)):
     with db() as conn:
         conn.execute("DELETE FROM dms WHERE from_id=? OR to_id=?", (uid, uid))
         conn.execute("DELETE FROM blocks WHERE blocker_id=? OR blocked_id=?", (uid, uid))
+        conn.execute("DELETE FROM convos WHERE user_a=? OR user_b=?", (uid, uid))
         for e in [r["id"] for r in conn.execute("SELECT id FROM events WHERE host_id=?", (uid,))]:
             conn.execute("DELETE FROM event_messages WHERE event_id=?", (e,))
             conn.execute("DELETE FROM rsvps WHERE event_id=?", (e,))

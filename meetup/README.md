@@ -15,7 +15,14 @@ Open http://localhost:8000. A SQLite database (`huddle.db`) is created and seede
   You land on events picked for you; a small banner offers to save your login file.
 - **Feed**: share news, finds and links, tagged by interest. "For you" ranks by your interests and city.
   Reply on a post. New accounts can't post links for 24 hours (anti-spam).
-- **Message in one tap**: a Message button next to people on events and in People. Chats update live.
+- **Message requests**: tap Message on anyone and send one first message as a request. They see it (with what
+  you have in common), then Accept, Decline or Block. Until they accept you can't send more; replying also
+  accepts. Declining is silent and permanent, so the sender just keeps seeing "Request sent" and can't pester.
+  Requests can be reported before accepting. A badge on Messages shows how many are waiting.
+- **Live chats**: they update on their own, and a waiting screen unlocks by itself the moment a request is accepted.
+- **A calm, polished look**: ivory/ink/gold palette with a dark mode, serif headings, frosted header, springy
+  hover and press feedback, animated menus, dialogs and chat bubbles, skeleton loading, and a phone layout.
+  Motion is switched off for people who prefer reduced motion. No third-party fonts or requests.
 - **Block in one tap** from a profile, chat, post or reply, with Undo; manage the list in Settings.
 - **Delete your account in two taps** (Settings): messages, posts, RSVPs, hosted events and keys are erased.
   Safety reports involving the account are retained so abuse can still be investigated.
@@ -24,8 +31,7 @@ Open http://localhost:8000. A SQLite database (`huddle.db`) is created and seede
 - **Interest matching**: events and people ranked by what you have in common ("Best for me", People tab).
 - **Who's going**: every attendee shows shared interests with you.
 - **Icebreakers + event conversation**: RSVP'd attendees can chat, with one-tap conversation starters.
-- **Direct messages** with a shared-interest conversation starter. You can message people you share an event
-  with (a deliberate safety rule; relax it in `dm_allowed()` in `server.py` if you prefer).
+- **Direct messages** with a shared-interest conversation starter.
 - **Inclusive profiles**: optional pronouns, "looking for" goals (friends, activity partners, networking...), no gender field.
 
 ## Privacy and safety model
@@ -43,8 +49,9 @@ database access can read DMs. Both people can compare a safety number to detect 
 - Moderator API (`/api/mod/*`, see `/docs`): list/read/resolve reports (child-safety reports sorted first),
   suspend users, read/delete event messages, read the audit log. Auth: `X-Mod-Key` header matching the
   `HUDDLE_MOD_KEY` env var (24+ chars; the API is disabled if unset). Every call is written to an audit log.
-- Safety by design: 18+ only (birth date checked once, not stored), DMs only between people who share an
-  event, blocking, per-account limits that are tighter for accounts under 24 hours old.
+- Safety by design: 18+ only (birth date checked once, not stored), every new conversation starts as a request
+  the recipient must accept, blocking, and per-account limits (new accounts: 3 new requests a day, 1 hosted
+  event, no links for 24 hours).
 
 **Easy to join, hard to bot**: no password or email. Sign-up needs a small proof-of-work (a couple of seconds in
 the browser; it automatically gets harder if sign-ups spike), plus a honeypot field, single-use signed

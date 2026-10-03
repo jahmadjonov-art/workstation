@@ -85,8 +85,21 @@ const toast = (m, action) => {
   if (action) { const b = document.createElement('button'); b.textContent = action.label; b.onclick = () => { t.classList.remove('show'); action.fn(); }; t.append(' ', b); }
   t.classList.add('show'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), action ? 7000 : 2800);
 };
-const colors = ['#ff5a4e', '#0f9d8a', '#7c5cff', '#e6a100', '#2b7de9', '#d6409f'];
-const avatar = (u, cls = '') => `<span class="avatar ${cls}" style="background:${colors[u.id % colors.length]}" title="${esc(u.name)}">${esc(u.name.trim()[0] || '?').toUpperCase()}</span>`;
+const colors = [['#d9b36e', '#9a6b27'], ['#7fae9b', '#2f5d4f'], ['#b49bc4', '#5f4b78'], ['#df9c88', '#9b4b39'], ['#86a7c8', '#3f6289'], ['#c2ba85', '#716b31']];
+const avatar = (u, cls = '') => { const [a, b] = colors[u.id % colors.length]; return `<span class="avatar ${cls}" style="background:linear-gradient(135deg,${a},${b})" title="${esc(u.name)}">${esc(u.name.trim()[0] || '?').toUpperCase()}</span>`; };
+const ICONS = {
+  lock: '<rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+  chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/>',
+  save: '<path d="M12 4v11"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/>',
+  check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+};
+const ico = n => `<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n]}</svg>`;
+const skel = n => Array.from({ length: n }, () => '<div class="card skel"><i></i><i></i><i></i></div>').join('');
+const reveal = (el, html) => {  // fill a list; stagger-animate only the first time it appears
+  el.innerHTML = html;
+  if (!el.dataset.in) { el.dataset.in = 1; el.classList.add('stagger'); setTimeout(() => el.classList.remove('stagger'), 1400); }
+};
 const fmt = iso => new Date(iso).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 const ago = iso => { const s = (Date.now() - new Date(iso)) / 1000; return s < 60 ? 'just now' : s < 3600 ? Math.floor(s / 60) + 'm ago' : s < 86400 ? Math.floor(s / 3600) + 'h ago' : Math.floor(s / 86400) + 'd ago'; };
 const chips = (xs, cls = '') => xs.map(x => `<span class="chip ${cls}">${esc(x)}</span>`).join('');
@@ -104,12 +117,17 @@ async function loadMe() {
     ? `<details class="more usermenu"><summary>${avatar(me)}<span>${esc(me.name.split(' ')[0])}</span></summary><div>
         <a href="#/user/${me.id}">My profile</a><a href="#/settings">Settings</a><button data-act="signout">Sign out</button></div></details>`
     : `<a class="btn ghost" href="#/login">Log in</a> <a class="btn" href="#/join">Join free</a>`;
-  renderBanner();
+  renderBanner(); refreshBadge();
 }
+async function refreshBadge() {
+  const b = $('#mbadge'); if (!b) return;
+  try { const n = me ? (await api('/me/counts')).requests : 0; b.textContent = n || ''; } catch { b.textContent = ''; }
+}
+setInterval(() => document.hidden || refreshBadge(), 30000);
 function renderBanner() {
   const el = $('#banner'); if (!el) return;
   const show = me && !store.get('huddle_saved_' + me.id) && privJwk();
-  el.innerHTML = show ? `<div class="banner">💾 <span>Save your login file so you never lose your account or messages.</span> <button class="btn" data-act="save-login">Save it</button></div>` : '';
+  el.innerHTML = show ? `<div class="banner">${ico('save')}<span>Save your login file so you never lose your account or messages.</span> <button class="btn" data-act="save-login">Save it</button></div>` : '';
 }
 const needMe = () => { if (!me) { toast('Join free to do that. It takes a minute.'); location.hash = '#/join'; return false; } return true; };
 
@@ -147,6 +165,8 @@ document.addEventListener('click', async e => {
     } else if (act === 'del-post') { await api('/posts/' + id, { method: 'DELETE' }); toast('Post deleted'); location.hash.startsWith('#/post/') ? (location.hash = '#/feed') : route();
     } else if (act === 'del-reply') { await api('/replies/' + id, { method: 'DELETE' }); route();
     } else if (act === 'tag') { feedTag = id; location.hash = '#/feed'; route();
+    } else if (act === 'accept-req') { await api(`/requests/${id}/accept`, { method: 'POST' }); toast('Accepted. You can chat now.'); refreshBadge(); route();
+    } else if (act === 'decline-req') { await api(`/requests/${id}/decline`, { method: 'POST' }); toast("Declined. They won't be told."); refreshBadge(); route();
     } else if (act === 'unblock') { await api('/blocks/' + id, { method: 'DELETE' }); toast('Unblocked'); route();
     }
   } catch (err) { toast(err.message); }
@@ -165,11 +185,11 @@ async function home() {
     <input id="city" placeholder="City" value="${esc(me?.city || '')}">
     ${me ? `<select id="sort"><option value="match">Best for me</option><option value="soon">Soonest</option></select>` : ''}
   </div>
-  <div id="list" class="grid"></div>`;
+  <div id="list" class="grid">${skel(6)}</div>`;
   const run = async () => {
     const p = new URLSearchParams({ q: $('#q').value, category: $('#cat').value, city: $('#city').value, sort: $('#sort')?.value || 'soon' });
     const evs = await api('/events?' + p);
-    $('#list').innerHTML = evs.length ? evs.map(eventCard).join('') : '<div class="empty" style="grid-column:1/-1">No events match. Try clearing the city filter, or <a href="#/create">host one</a>.</div>';
+    reveal($('#list'), evs.length ? evs.map(eventCard).join('') : '<div class="empty" style="grid-column:1/-1">No events match. Try clearing the city filter, or <a href="#/create">host one</a>.</div>');
   };
   let t; ['q', 'city'].forEach(i => $('#' + i).oninput = () => { clearTimeout(t); t = setTimeout(run, 250); });
   ['cat', 'sort'].forEach(i => $('#' + i) && ($('#' + i).onchange = run));
@@ -197,10 +217,10 @@ async function eventPage(id) {
     <p class="muted">${esc(e.venue)}, ${esc(e.city)} · Hosted by <a href="#/user/${e.host.id}">${esc(e.host.name)}</a></p>
     <div class="chips"><span class="chip warm">${esc(e.category)}</span>${e.vibe ? `<span class="chip plain">${esc(e.vibe)}</span>` : ''}${chips(e.tags)}</div>
     <p style="white-space:pre-wrap">${esc(e.description)}</p>
-    <div class="row" style="align-items:center"><button class="btn" id="rsvp" ${full ? 'disabled' : ''}>${e.going ? '✓ Going, tap to cancel' : full ? 'Event is full' : 'Count me in'}</button>
+    <div class="row" style="align-items:center"><button class="btn" id="rsvp" ${full ? 'disabled' : ''}>${e.going ? `${ico('check')} Going. Tap to cancel` : full ? 'Event is full' : 'Count me in'}</button>
     ${me && me.id !== e.host.id ? moreMenu([{ act: 'report', kind: 'event', id: e.id, label: 'Report this event' }]) : ''}</div>
     <h2>Chat</h2>
-    <p class="muted" style="margin-top:-6px"><small>Event chat is public to attendees and watched by our safety team. For private chats, tap Message on a person.</small></p>
+    <p class="muted" style="margin-top:-6px"><small>Event chat is public to attendees and watched by our safety team. For a private chat, tap Message next to a person.</small></p>
     <div class="panel">
       ${e.messages.map(m => `<div class="msg"><div class="row between"><b><a href="#/user/${m.user.id}">${esc(m.user.name)}</a></b>${personMenu(m.user, [{ act: 'report', kind: 'event_message', id: m.id, label: 'Report message' }])}</div>${esc(m.body)}</div>`).join('') || '<div class="muted">Nobody has said anything yet. Break the ice!</div>'}
       ${e.going ? `<div class="row" style="margin-top:12px"><input id="msg" maxlength="1000" placeholder="Say hi to the group"><button class="btn" id="send">Send</button></div>
@@ -211,7 +231,7 @@ async function eventPage(id) {
   <aside><div class="panel"><h3>Who's going (${e.attendee_count}/${e.capacity})</h3>
     ${e.attendees.map(a => `<div class="person">${avatar(a)}<div class="info"><a class="name" href="#/user/${a.id}">${esc(a.name)}</a> <small>${esc(a.pronouns)}</small>
       ${a.shared?.length ? `<div class="chips" style="margin-top:4px">${chips(a.shared)}</div><small>in common with you</small>` : `<div class="muted" style="font-size:.85rem">${esc(a.interests.slice(0, 3).join(', '))}</div>`}</div>
-      ${e.going && me && a.id !== me.id && a.public_key ? `<a class="btn small" href="#/dm/${a.id}">Message</a>` : ''}</div>`).join('')}
+      ${me && a.id !== me.id && a.public_key ? `<a class="btn small ghost" href="#/dm/${a.id}">Message</a>` : ''}</div>`).join('')}
   </div></aside></div>`;
   $('#rsvp').onclick = async () => {
     if (!needMe()) return;
@@ -235,9 +255,9 @@ const postCard = (p, full = false) => `
   <div class="row between"><div class="row" style="align-items:center">${avatar(p.author)}<div><a class="name" href="#/user/${p.author.id}"><b>${esc(p.author.name)}</b></a><br><small class="muted">${esc(p.city)} · ${ago(p.created)}</small></div></div>
   ${me ? moreMenu(p.mine ? [{ act: 'del-post', id: p.id, label: 'Delete post', danger: true }] : [{ act: 'report', kind: 'post', id: p.id, label: 'Report post' }, { act: 'block', id: p.author.id, name: p.author.name, label: `Block ${esc(p.author.name.split(' ')[0])}`, danger: true }]) : ''}</div>
   <p class="postbody">${esc(p.body)}</p>
-  ${p.url ? `<a class="link" href="${esc(p.url)}" target="_blank" rel="nofollow noopener noreferrer ugc">🔗 ${esc(host(p.url))}</a>` : ''}
+  ${p.url ? `<a class="link" href="${esc(p.url)}" target="_blank" rel="nofollow noopener noreferrer ugc">${ico('link')} ${esc(host(p.url))}</a>` : ''}
   <div class="chips">${p.tags.map(t => `<button class="chip ${p.match?.includes(t) ? '' : 'plain'}" data-act="tag" data-id="${esc(t)}">${esc(t)}</button>`).join('')}</div>
-  ${full ? '' : `<a class="muted" href="#/post/${p.id}">💬 ${p.reply_count ? p.reply_count + (p.reply_count === 1 ? ' reply' : ' replies') : 'Reply'}</a>`}
+  ${full ? '' : `<a class="muted" href="#/post/${p.id}">${ico('chat')} ${p.reply_count ? p.reply_count + (p.reply_count === 1 ? ' reply' : ' replies') : 'Reply'}</a>`}
 </article>`;
 
 async function feed() {
@@ -250,7 +270,7 @@ async function feed() {
     <div class="row between" style="margin-top:10px"><button class="linkbtn" id="addlink" type="button">+ Add a link</button><button class="btn" id="post">Post</button></div></div>` : `<div class="panel"><a href="#/join" class="btn">Join free</a> <span class="muted">to share and reply.</span></div>`}
   <div class="pills">${[['foryou', 'For you'], ['near', 'Near me'], ['all', 'Everyone']].filter(([k]) => me || k === 'all').map(([k, l]) => `<button class="pill ${feedScope === k ? 'on' : ''}" data-s="${k}">${l}</button>`).join('')}
     ${feedTag ? `<button class="pill on" id="cleartag">#${esc(feedTag)} ×</button>` : ''}</div>
-  <div id="posts" class="stack"></div>`;
+  <div id="posts" class="stack">${skel(3)}</div>`;
   document.querySelectorAll('.pill[data-s]').forEach(b => b.onclick = () => { feedScope = b.dataset.s; feed(); });
   $('#cleartag')?.addEventListener('click', () => { feedTag = ''; feed(); });
   if (me) {
@@ -262,7 +282,7 @@ async function feed() {
     };
   }
   const posts = await api(`/posts?scope=${feedScope}&tag=${encodeURIComponent(feedTag)}`);
-  $('#posts').innerHTML = posts.map(p => postCard(p)).join('') || `<div class="empty">Nothing here yet. ${feedScope === 'near' ? 'Try “Everyone”, or ' : ''}be the first to share something!</div>`;
+  reveal($('#posts'), posts.map(p => postCard(p)).join('') || `<div class="empty">Nothing here yet. ${feedScope === 'near' ? 'Try “Everyone”, or ' : ''}be the first to share something!</div>`);
 }
 
 async function postPage(id) {
@@ -284,11 +304,11 @@ async function people() {
   if (!needMe()) return;
   const list = await api('/me/matches');
   app.innerHTML = `<h1>People you may click with</h1><p class="muted" style="margin-top:-4px">Based on your interests, where you live, and what you're looking for.</p>
-  <div class="grid">${list.map(u => `<div class="card"><div class="row" style="align-items:center">${avatar(u, 'lg')}<div class="grow"><a href="#/user/${u.id}"><h3>${esc(u.name)}</h3></a><small class="muted">${esc(u.city)} ${esc(u.pronouns)}</small></div></div>
+  <div class="grid stagger">${list.map(u => `<div class="card"><div class="row" style="align-items:center">${avatar(u, 'lg')}<div class="grow"><a href="#/user/${u.id}"><h3>${esc(u.name)}</h3></a><small class="muted">${esc(u.city)} ${esc(u.pronouns)}</small></div></div>
     <div class="chips">${chips(u.shared)}</div>
     ${u.shared_goals.length ? `<small>Both looking for: ${esc(u.shared_goals.join(', '))}</small>` : ''}
     ${u.events_in_common ? `<small>${u.events_in_common} event${u.events_in_common > 1 ? 's' : ''} in common</small>` : ''}
-    <div class="row" style="margin-top:4px">${u.can_message ? `<a class="btn small" href="#/dm/${u.id}">Message</a>` : u.public_key ? `<a class="btn small ghost" href="#/user/${u.id}">See profile</a>` : '<small class="muted">Sample profile</small>'}</div></div>`).join('') || '<div class="empty">Add some interests to your profile to see people.</div>'}</div>`;
+    <div class="row" style="margin-top:4px">${u.chat === 'accepted' ? `<a class="btn small" href="#/dm/${u.id}">Open chat</a>` : u.chat === 'request_out' ? `<a class="btn small ghost" href="#/dm/${u.id}">Request sent</a>` : u.chat === 'request_in' ? `<a class="btn small" href="#/dm/${u.id}">Respond</a>` : u.can_message ? `<a class="btn small" href="#/dm/${u.id}">Message</a>` : '<small class="muted">Sample profile</small>'}</div></div>`).join('') || '<div class="empty">Add some interests to your profile to see people.</div>'}</div>`;
 }
 
 async function userPage(id) {
@@ -301,10 +321,12 @@ async function userPage(id) {
   ${u.shared?.length ? `<div class="match">You both like: ${esc(u.shared.join(', '))}</div>` : ''}
   ${u.shared_events?.length ? `<p class="muted">You're both going to: ${esc(u.shared_events.join(', '))}</p>` : ''}
   <p>${mine ? '<a class="btn ghost" href="#/join?edit=1">Edit profile</a> <a class="btn ghost" href="#/settings">Settings</a>'
+    : u.chat === 'request_in' ? `<a class="btn" href="#/dm/${u.id}">Respond to ${esc(u.name.split(' ')[0])}'s request</a>`
+    : u.chat === 'request_out' ? `<a class="btn ghost" href="#/dm/${u.id}">Request sent</a>`
     : u.can_message ? `<a class="btn" href="#/dm/${u.id}">Message ${esc(u.name.split(' ')[0])}</a>`
-    : !u.public_key ? '<span class="muted">Sample profile (no messaging)</span>'
     : u.blocked ? `<button class="btn ghost" data-act="unblock" data-id="${u.id}">Unblock</button>`
-    : me ? '<span class="muted">You can chat once you\'re both going to the same event. <a href="#/">Find one</a></span>' : '<a class="btn" href="#/join">Join free to message</a>'}</p></div>
+    : !u.public_key ? '<span class="muted">Sample profile (no messaging)</span>'
+    : me ? '<span class="muted">Messaging isn\'t available for this person.</span>' : '<a class="btn" href="#/join">Join free to message</a>'}</p></div>
   <h2>Upcoming events</h2><div class="panel">${u.events.map(e => `<div class="msg"><a href="#/event/${e.id}">${esc(e.title)}</a> <small>${fmt(e.starts)}</small></div>`).join('') || '<span class="muted">Nothing yet.</span>'}</div>`;
 }
 
@@ -424,53 +446,82 @@ function create() {
 
 async function inbox() {
   if (!needMe()) return;
-  app.innerHTML = '<h1>Messages</h1><p class="muted" style="margin-top:-4px">🔒 Private. Only you and the other person can read these.</p><div class="panel" id="threads"></div>';
+  app.innerHTML = `<h1>Messages</h1><p class="muted" style="margin-top:-4px">${ico('lock')} Private. Only you and the other person can read these.</p><div id="reqs"></div><div class="panel" id="threads">${skel(1)}</div>`;
   let last = '';
   const load = async () => {
     const th = await api('/inbox');
-    const key = th.map(t => t.user.id + ':' + t.created).join();
+    const key = th.map(t => `${t.user.id}:${t.created}:${t.status}`).join();
     if (key === last) return; last = key;
-    const rows = await Promise.all(th.map(async t => {
-      let preview = '🔒 Encrypted message';
+    const row = async t => {
+      let preview = 'Encrypted message';
       try { preview = await decrypt(await convoKey(t.user.public_key), t); } catch {}
-      return `<a class="person thread" href="#/dm/${t.user.id}">${avatar(t.user)}<div class="info"><b>${esc(t.user.name)}</b> <small class="muted">${ago(t.created)}</small><br><span class="muted">${t.mine ? 'You: ' : ''}${esc(preview.slice(0, 100))}</span></div></a>`;
-    }));
-    $('#threads').innerHTML = rows.join('') || '<div class="empty">No messages yet.<br>Count yourself in to an event, then tap <b>Message</b> next to someone you\'d like to meet.</div>';
+      return { t, preview };
+    };
+    const items = await Promise.all(th.map(row));
+    const reqs = items.filter(i => i.t.status === 'request_in'), rest = items.filter(i => i.t.status !== 'request_in');
+    $('#reqs').innerHTML = reqs.length ? `<h2 class="sect">Message requests <span class="count">${reqs.length}</span></h2><div class="stack">${reqs.map(({ t, preview }) => {
+      const common = t.user.interests.filter(i => me.interests.some(m => m.toLowerCase() === i.toLowerCase()));
+      return `<div class="panel request"><a class="row" style="align-items:center;text-decoration:none" href="#/dm/${t.user.id}">${avatar(t.user, 'lg')}<div class="grow"><b>${esc(t.user.name)}</b> <small class="muted">${esc(t.user.city)} · ${ago(t.created)}</small>
+        ${common.length ? `<div class="chips" style="margin-top:4px">${chips(common)}</div>` : ''}</div></a>
+        <p class="quote">${esc(preview.slice(0, 280))}</p>
+        <div class="row"><button class="btn small" data-act="accept-req" data-id="${t.user.id}">Accept</button><button class="btn small ghost" data-act="decline-req" data-id="${t.user.id}">Decline</button>
+        ${moreMenu([{ act: 'block', id: t.user.id, name: t.user.name, label: `Block ${esc(t.user.name.split(' ')[0])}`, danger: true }])}</div></div>`; }).join('')}</div><h2 class="sect">Chats</h2>` : '';
+    $('#threads').innerHTML = rest.map(({ t, preview }) => `<a class="person thread" href="#/dm/${t.user.id}">${avatar(t.user)}<div class="info"><b>${esc(t.user.name)}</b> <small class="muted">${ago(t.created)}</small><br>
+      <span class="muted">${t.status === 'request_out' ? '<span class="tag">Request sent</span> ' : t.mine ? 'You: ' : ''}${esc(preview.slice(0, 100))}</span></div></a>`).join('')
+      || (reqs.length ? '<div class="empty">Accept a request to start chatting.</div>' : '<div class="empty">No messages yet.<br>Tap <b>Message</b> on someone\'s profile to send a request.</div>');
+    refreshBadge();
   };
   await load(); poll(load, 6000);
 }
 
 async function dm(other) {
   if (!needMe()) return;
+  timers.forEach(clearInterval); timers = [];
   const u = await api('/users/' + other);
   if (!u.public_key) { app.innerHTML = '<div class="empty">This sample profile can\'t receive messages.</div>'; return; }
   const raw = await convoKey(u.public_key);
   dmCtx = { id: +other, raw };
   const sn = await safetyNumber(u.public_key);
+  const first = esc(u.name.split(' ')[0]);
+  const bottom = {
+    none: `<p class="hint">${first} will get a message request. You can keep chatting once they accept.</p><div class="row"><input id="m" maxlength="1500" placeholder="Introduce yourself…"><button class="btn" id="s">Send request</button></div>`,
+    accepted: `<div class="row"><input id="m" maxlength="1500" placeholder="Write a message"><button class="btn" id="s">Send</button></div>`,
+    request_out: `<p class="hint" style="margin:0">Request sent. You can keep chatting once ${first} accepts.</p>`,
+    request_in: `<p class="hint">${first} would like to chat. Accept to reply, or decline and they won't be told.</p><div class="row"><button class="btn" id="acc">Accept</button><button class="btn ghost" id="dec">Decline</button></div>`,
+    unavailable: `<p class="hint" style="margin:0">This person can't be messaged right now.</p>`,
+  }[u.chat || 'none'];
   app.innerHTML = `<div class="row between"><a href="#/inbox" class="muted">&larr; Messages</a>${personMenu(u, [{ act: 'report', kind: 'dm', id: u.id, label: 'Report conversation' }])}</div>
-  <div class="row" style="align-items:center;margin:8px 0"><a href="#/user/${u.id}">${avatar(u, 'lg')}</a><div><h1 style="margin:0"><a href="#/user/${u.id}">${esc(u.name)}</a></h1><small class="muted">🔒 Private. <span title="If this matches on their screen, no one is in the middle.">Safety number: <code>${sn}</code></span></small></div></div>
+  <div class="row" style="align-items:center;margin:8px 0"><a href="#/user/${u.id}">${avatar(u, 'lg')}</a><div><h1 style="margin:0"><a href="#/user/${u.id}">${esc(u.name)}</a></h1><small class="muted">${ico('lock')} Private. <span title="If this matches on their screen, no one is in the middle.">Safety number <code>${sn}</code></span></small></div></div>
   ${u.shared?.length ? `<div class="match">Conversation starter: you both like ${esc(u.shared.join(', '))}</div>` : ''}
-  <div class="panel chat"><div id="bubbles"></div>
-  ${u.can_message ? `<div class="row" style="margin-top:12px"><input id="m" maxlength="1500" placeholder="Write a message" autofocus><button class="btn" id="s">Send</button></div>`
-    : '<p class="muted" style="margin-bottom:0">You can chat once you\'re both going to the same event.</p>'}</div>`;
-  let lastKey = '';
+  <div class="panel chat"><div id="bubbles"></div><div class="composer-bar">${bottom}</div></div>`;
+  let seen = 0, lastId = 0;
   const load = async () => {
     const msgs = await api(`/dm/${other}`);
-    const k = msgs.length + ':' + (msgs.at(-1)?.id || 0); if (k === lastKey) return; lastKey = k;
-    const plain = await Promise.all(msgs.map(m => decrypt(raw, m)));
+    const id = msgs.at(-1)?.id || 0; if (msgs.length === seen && id === lastId) return;
     const box = $('#bubbles'); if (!box) return;
-    box.innerHTML = msgs.map((m, i) => `<div class="bubble ${m.from_id === me.id ? 'mine' : ''}">${esc(plain[i])}</div>`).join('') || '<div class="muted">Say hello 👋</div>';
-    box.scrollTop = box.scrollHeight;
+    const fresh = msgs.slice(seen); const plain = await Promise.all(fresh.map(m => decrypt(raw, m)));
+    if (!seen) box.innerHTML = '';
+    box.insertAdjacentHTML('beforeend', fresh.map((m, i) => `<div class="bubble ${m.from_id === me.id ? 'mine' : ''} ${seen ? 'new' : ''}">${esc(plain[i])}</div>`).join(''));
+    if (!msgs.length) box.innerHTML = `<div class="muted" style="padding:6px 2px">${u.chat === 'none' ? `Say hello to ${first}.` : 'No messages yet.'}</div>`;
+    seen = msgs.length; lastId = id; box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
   };
-  await load(); poll(load, 4000);
-  if (u.can_message) {
+  await load();
+  if (u.chat !== 'unavailable') {
+    poll(load, 4000);
+    // if the other person accepts (or the situation changes) while this screen is open, update it
+    poll(async () => { const now = (await api('/users/' + other)).chat || 'none'; if (now !== (u.chat || 'none')) dm(other); }, 5000);
+  }
+  if ($('#m')) {
     const send = async () => {
       const b = $('#m').value.trim(); if (!b) return;
       $('#m').value = '';
-      try { await api('/dm', { method: 'POST', body: { to_id: +other, ...(await encrypt(raw, b)) } }); await load(); } catch (e) { $('#m').value = b; toast(e.message); }
+      try { await api('/dm', { method: 'POST', body: { to_id: +other, ...(await encrypt(raw, b)) } }); if (u.chat === 'none') { toast(`Request sent to ${u.name.split(' ')[0]}`); dm(other); } else await load(); }
+      catch (e) { $('#m').value = b; toast(e.message); }
     };
     $('#s').onclick = send; $('#m').onkeydown = k => k.key === 'Enter' && send(); $('#m').focus();
   }
+  $('#acc')?.addEventListener('click', async () => { await api(`/requests/${other}/accept`, { method: 'POST' }); toast('Accepted. Say hello!'); refreshBadge(); dm(other); });
+  $('#dec')?.addEventListener('click', async () => { await api(`/requests/${other}/decline`, { method: 'POST' }); toast("Declined. They won't be told."); refreshBadge(); location.hash = '#/inbox'; });
 }
 
 const routes = [
@@ -482,8 +533,12 @@ async function route() {
   const h = location.hash || '#/';
   timers.forEach(clearInterval); timers = [];
   document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.getAttribute('href') === h || (a.getAttribute('href') === '#/inbox' && h.startsWith('#/dm/'))));
-  for (const [re, fn] of routes) { const m = h.match(re); if (m) { window.scrollTo(0, 0); return fn(m[1]).catch(e => app.innerHTML = `<div class="empty">${esc(e.message)}</div>`); } }
-  window.scrollTo(0, 0); home().catch(e => app.innerHTML = `<div class="empty">${esc(e.message)}</div>`);
+  window.scrollTo({ top: 0 });
+  app.classList.remove('enter'); void app.offsetWidth; app.classList.add('enter');
+  const done = () => { clearTimeout(route.t); route.t = setTimeout(() => app.classList.remove('enter'), 1200); };
+  const fail = e => app.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  for (const [re, fn] of routes) { const m = h.match(re); if (m) return fn(m[1]).catch(fail).finally(done); }
+  return home().catch(fail).finally(done);
 }
 addEventListener('hashchange', route);
 (async () => { meta = await api('/meta'); await loadMe(); route(); })();
