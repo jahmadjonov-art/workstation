@@ -10,3 +10,4 @@ build/
 huddle.db
 .pytest_cache/
 meetup/demo/dist/
+meetup/uploads/

@@ -11,12 +11,16 @@ const store = {
   del: k => { try { localStorage.removeItem(k); } catch { mem.delete(k); } },
 };
 const token = () => store.get('huddle_token');
+class Stale extends Error {}  // thrown when a page load finishes after you have already moved to another page
+let routeSeq = 0;
 const api = async (path, opts = {}) => {
+  const seq = routeSeq, isGet = !opts.method || opts.method === 'GET';
   const headers = { 'Content-Type': 'application/json' };
   if (token()) headers.Authorization = 'Bearer ' + token();
   let r;
   try { r = await fetch('/api' + path, { headers, ...opts, body: opts.body ? JSON.stringify(opts.body) : undefined }); }
   catch { throw new Error("Can't reach the Huddle server. Check your connection and try again."); }
+  if (isGet && seq !== routeSeq) throw new Stale();
   if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(typeof e.detail === 'string' ? e.detail : 'Something went wrong'); }
   return r.json();
 };
@@ -118,7 +122,7 @@ async function loadMe() {
 }
 async function refreshBadge() {
   const b = $('#mbadge'); if (!b) return;
-  try { const n = me ? (await api('/me/counts')).requests : 0; b.textContent = n || ''; } catch { b.textContent = ''; }
+  try { const n = me ? (await api('/me/counts')).requests : 0; b.textContent = n || ''; } catch (e) { if (!(e instanceof Stale)) b.textContent = ''; }
 }
 setInterval(() => document.hidden || refreshBadge(), 30000);
 function renderBanner() {
@@ -139,6 +143,7 @@ const REPORT_INFO = {
   reply: ['Report this reply', 'The reply and who wrote it will be shared with our safety team.'],
   event_message: ['Report this message', 'The message and who sent it will be shared with our safety team.'],
   event: ['Report this event', 'The event will be shared with our safety team.'],
+  group: ['Report this group', 'The group, its description and who started it will be shared with our safety team. Use this if a group is labelled open but is really 18+.'],
 };
 
 async function blockUser(id, name) {
@@ -151,7 +156,7 @@ document.addEventListener('click', async e => {
   const el = e.target.closest('[data-act]');
   if (!el) {  // whole timeline row is clickable, except links, buttons and menus inside it
     const row = e.target.closest('[data-href]');
-    if (row && !e.target.closest('a,button,details,input,textarea,select')) location.hash = row.dataset.href;
+    if (row && !e.target.closest('a,button,details,input,textarea,select,video')) location.hash = row.dataset.href;
     return;
   }
   const { act, id, kind, name } = el.dataset;
@@ -167,33 +172,70 @@ document.addEventListener('click', async e => {
     } else if (act === 'del-post') { await api('/posts/' + id, { method: 'DELETE' }); toast('Post deleted'); location.hash.startsWith('#/post/') ? (location.hash = '#/') : route();
     } else if (act === 'del-reply') { await api('/replies/' + id, { method: 'DELETE' }); route();
     } else if (act === 'tag') { feedTag = id; if (location.hash === '#/' || location.hash === '') route(); else location.hash = '#/';
+    } else if (act === 'like') {
+      if (!needMe()) return;
+      const r = await api(`/posts/${id}/like`, { method: el.classList.contains('on') ? 'DELETE' : 'PUT' });
+      el.classList.toggle('on', r.liked); el.textContent = `${r.liked ? 'Liked' : 'Like'}${r.like_count ? ' · ' + r.like_count : ''}`;
+    } else if (act === 'repost') { if (needMe()) repostDialog(id);
+    } else if (act === 'zoom') {
+      const d = document.createElement('dialog'); d.className = 'lightbox';
+      d.innerHTML = `<form method="dialog"><img src="${esc(el.dataset.src)}" alt="Photo"><button class="btn ghost small" value="close">Close</button></form>`;
+      document.body.appendChild(d); d.addEventListener('close', () => d.remove()); d.showModal();
+    } else if (act === 'reveal') { el.closest('.media').classList.remove('blur'); el.remove();
+    } else if (act === 'join-group') {
+      if (!needMe()) return;
+      if (kind === '1' && !(await confirmDialog({ title: 'This is an 18+ group', text: 'It is for 18+ activities and topics. Join anyway?', ok: 'Join group' }))) return;
+      await api(`/groups/${id}/join`, { method: 'POST' }); toast('Joined the group'); route();
+    } else if (act === 'leave-group') { await api(`/groups/${id}/join`, { method: 'DELETE' }); toast('You left the group'); route();
+    } else if (act === 'delete-group') {
+      if (await confirmDialog({ title: 'Delete this group?', text: 'This removes the group and all of its posts and photos for everyone. It cannot be undone.', ok: 'Delete group', danger: true })) { await api('/groups/' + id, { method: 'DELETE' }); toast('Group deleted'); location.hash = '#/groups'; }
+    } else if (act === 'remove-member') { await api(`/groups/${kind}/members/${id}`, { method: 'DELETE' }); toast('Removed from the group'); route();
+    } else if (act === 'group-remove-post') { await api(`/groups/${kind}/posts/${id}`, { method: 'DELETE' }); toast('Post removed'); route();
+    } else if (act === 'mature-on') {
+      if (await confirmDialog({ title: 'Turn on 18+ groups?', text: 'You will be able to find and join groups for 18+ activities. They stay separate from the rest of Huddle, and you can turn this off any time in Settings.', ok: 'Turn on' })) {
+        await api('/me/prefs', { method: 'PUT', body: { show_mature: true } }); me = await api('/me'); toast('18+ groups are on'); route();
+      }
+    } else if (act === 'mature-off') { await api('/me/prefs', { method: 'PUT', body: { show_mature: false } }); me = await api('/me'); toast('18+ groups are hidden again'); route();
     } else if (act === 'accept-req') { await api(`/requests/${id}/accept`, { method: 'POST' }); toast('Accepted. You can chat now.'); refreshBadge(); route();
     } else if (act === 'decline-req') { await api(`/requests/${id}/decline`, { method: 'POST' }); toast("Declined. They won't be told."); refreshBadge(); route();
     } else if (act === 'unblock') { await api('/blocks/' + id, { method: 'DELETE' }); toast('Unblocked'); route();
     }
-  } catch (err) { toast(err.message); }
+  } catch (err) { if (!(err instanceof Stale)) toast(err.message); }
 });
 
 /* ---------- layout: left column, centre, right column ---------- */
 const leftCol = () => me ? `
   <div class="box profile"><a class="who" href="#/user/${me.id}">${avatar(me, 'lg')}<span><b>${esc(me.name)}</b><small>${esc(me.city)}</small></span></a>
     <div class="stats"><a href="#/user/${me.id}"><b>${me.stats?.posts ?? 0}</b>Posts</a><a href="#/events"><b>${me.stats?.events ?? 0}</b>Events</a><a href="#/join?edit=1"><b>${me.interests.length}</b>Interests</a></div></div>
+  <div class="box" id="w-mygroups"><h4>Your groups</h4><div class="loading">Loading…</div></div>
   ${me.interests.length ? `<div class="box"><h4>Your interests</h4><div class="tags">${me.interests.slice(0, 10).map(hashtag).join(' ')}</div><a class="more-link" href="#/join?edit=1">Edit</a></div>` : ''}`
   : `<div class="box"><h4>New to Huddle?</h4><p class="sub" style="margin:6px 0 12px">Meet people near you who share your interests. Free. No password, no email.</p><a class="btn" href="#/join">Join free</a> <a class="btn ghost" href="#/login">Log in</a></div>`;
 const rightCol = () => `
   ${me ? '<div class="box" id="w-people"><h4>People you may like</h4><div class="loading">Loading…</div></div>' : ''}
+  <div class="box" id="w-groups"><h4>Groups you might like</h4><div class="loading">Loading…</div></div>
   <div class="box" id="w-events"><h4>Happening nearby</h4><div class="loading">Loading…</div></div>
   <div class="box" id="w-trends"><h4>Interests people are posting about</h4><div class="loading">Loading…</div></div>
   <p class="fine">18+ only. See something wrong? Report it from the menu on any post, message or profile.</p>`;
-const shell = (main, { right = false, solo = false } = {}) => solo ? `<div class="solo">${main}</div>`
-  : `<div class="shell ${right ? 'has-right' : ''}"><aside class="left">${leftCol()}</aside><section class="main">${main}</section>${right ? `<aside class="right">${rightCol()}</aside>` : ''}</div>`;
+function shell(main, { right = false, solo = false } = {}) {
+  if (solo) return `<div class="solo">${main}</div>`;
+  setTimeout(fillWidgets, 0);  // fills the sidebar boxes once this markup is on the page
+  return `<div class="shell ${right ? 'has-right' : ''}"><aside class="left">${leftCol()}</aside><section class="main">${main}</section>${right ? `<aside class="right">${rightCol()}</aside>` : ''}</div>`;
+}
 
 async function fillWidgets() {
-  const q = async (id, fn) => { const el = $('#' + id); if (!el) return; try { const html = await fn(); if ($('#' + id)) $('#' + id).innerHTML = html; } catch { $('#' + id)?.remove(); } };
+  const q = async (id, fn) => { const el = $('#' + id); if (!el) return; try { const html = await fn(); if ($('#' + id)) $('#' + id).innerHTML = html; } catch (e) { if (!(e instanceof Stale)) $('#' + id)?.remove(); } };
   q('w-people', async () => {
     const ms = (await api('/me/matches')).slice(0, 3);
     return `<h4>People you may like</h4>${ms.map(u => `<div class="mini">${avatar(u)}<div class="grow"><a class="nm" href="#/user/${u.id}">${esc(u.name)}</a><small>${u.shared.length ? 'Likes ' + esc(u.shared.slice(0, 2).join(', ')) : esc(u.city)}</small></div>
       ${u.can_message ? `<a class="btn small ghost" href="#/dm/${u.id}">${u.chat === 'accepted' ? 'Chat' : u.chat === 'request_out' ? 'Sent' : 'Message'}</a>` : ''}</div>`).join('') || '<p class="sub">Add interests to see people.</p>'}<a class="more-link" href="#/people">View all</a>`;
+  });
+  q('w-mygroups', async () => {
+    const gs = await api('/groups?scope=mine');
+    return `<h4>Your groups</h4>${gs.slice(0, 6).map(g => `<a class="mini grp-mini" href="#/group/${g.id}">${groupAv(g)}<div class="grow"><span class="nm">${esc(g.name)}</span><small>${g.member_count} member${g.member_count === 1 ? '' : 's'}</small></div></a>`).join('') || '<p class="sub">Join a group to see it here.</p>'}<a class="more-link" href="#/groups">${gs.length ? 'All groups' : 'Find groups'}</a>`;
+  });
+  q('w-groups', async () => {
+    const gs = (await api('/groups?scope=discover')).filter(g => !g.joined).slice(0, 3);
+    return `<h4>Groups you might like</h4>${gs.map(g => `<div class="mini">${groupAv(g)}<div class="grow"><a class="nm" href="#/group/${g.id}">${esc(g.name)}</a><small>${g.member_count} member${g.member_count === 1 ? '' : 's'}</small></div><button class="btn small ghost" data-act="join-group" data-id="${g.id}" data-kind="0">Join</button></div>`).join('') || '<p class="sub">No suggestions right now.</p>'}<a class="more-link" href="#/groups">Browse groups</a>`;
   });
   q('w-events', async () => {
     const evs = (await api('/events?sort=' + (me ? 'match' : 'soon') + (me?.city ? '&city=' + encodeURIComponent(me.city) : ''))).slice(0, 4);
@@ -207,28 +249,121 @@ async function fillWidgets() {
   });
 }
 
-/* ---------- home: compose + timeline ---------- */
-const postRow = (p, full = false) => `
+/* ---------- posts: photos, videos, likes, comments, reposts ---------- */
+const confirmDialog = ({ title, text, ok = 'Continue', danger = false }) => new Promise(resolve => {
+  const d = document.createElement('dialog');
+  d.innerHTML = `<form method="dialog"><h3>${esc(title)}</h3><p class="sub">${esc(text)}</p>
+    <div class="row" style="margin-top:14px"><button class="btn ghost" value="no">Cancel</button><button class="btn ${danger ? 'danger' : ''}" value="yes">${esc(ok)}</button></div></form>`;
+  document.body.appendChild(d);
+  d.addEventListener('close', () => { resolve(d.returnValue === 'yes'); d.remove(); });
+  d.showModal();
+});
+
+async function uploadMedia(file) {
+  const fd = new FormData(); fd.append('file', file);
+  let r;
+  try { r = await fetch('/api/media', { method: 'POST', headers: { Authorization: 'Bearer ' + token() }, body: fd }); }
+  catch { throw new Error("Can't reach the Huddle server. Check your connection and try again."); }
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(typeof e.detail === 'string' ? e.detail : 'That upload did not work'); }
+  return r.json();
+}
+
+const mediaGrid = (media, blur = false) => !media.length ? '' : `<div class="media n${media.length} ${blur ? 'blur' : ''}">${media.map(m => m.kind === 'video'
+  ? `<video src="${esc(m.url)}" controls preload="metadata" playsinline></video>`
+  : `<button type="button" class="mimg" data-act="zoom" data-src="${esc(m.url)}" aria-label="View photo"><img src="${esc(m.url)}" alt="Photo" loading="lazy"></button>`).join('')}
+  ${blur ? '<button type="button" class="reveal" data-act="reveal">Tap to show</button>' : ''}</div>`;
+
+const likeLabel = p => `${p.liked ? 'Liked' : 'Like'}${p.like_count ? ' · ' + p.like_count : ''}`;
+const postActs = p => `<div class="acts">
+  <button type="button" class="act ${p.liked ? 'on' : ''}" data-act="like" data-id="${p.id}">${likeLabel(p)}</button>
+  <a class="act" href="#/post/${p.id}">Comment${p.reply_count ? ' · ' + p.reply_count : ''}</a>
+  ${p.group?.mature ? '' : `<button type="button" class="act ${p.reposted ? 'on' : ''}" data-act="repost" data-id="${p.id}" ${p.reposted || p.mine ? 'disabled' : ''}>${p.reposted ? 'Reposted' : 'Repost'}${p.repost_count ? ' · ' + p.repost_count : ''}</button>`}
+</div>`;
+
+const pill18 = '<span class="pill18" title="For 18+ activities">18+</span>';
+const embedPost = o => `<div class="embed" data-href="#/post/${o.id}"><div class="head"><span><a class="nm" href="#/user/${o.author.id}">${esc(o.author.name)}</a> <small>${esc(o.city)} &middot; ${ago(o.created)}</small></span></div>
+  ${o.body ? `<div class="txt">${esc(o.body)}</div>` : ''}${mediaGrid(o.media)}${hashtags(o.tags)}</div>`;
+
+const postRow = (p, full = false, ownerOfGroup = null) => `
 <article class="tw" ${full ? '' : `data-href="#/post/${p.id}"`}>
   <a href="#/user/${p.author.id}">${avatar(p.author, 'lg')}</a>
   <div class="body">
-    <div class="head"><span><a class="nm" href="#/user/${p.author.id}">${esc(p.author.name)}</a> <small>${esc(p.city)} &middot; ${ago(p.created)}</small></span>
-    ${me ? moreMenu(p.mine ? [{ act: 'del-post', id: p.id, label: 'Delete post', danger: true }] : [{ act: 'report', kind: 'post', id: p.id, label: 'Report post' }, { act: 'block', id: p.author.id, name: p.author.name, label: `Block ${esc(p.author.name.split(' ')[0])}`, danger: true }]) : ''}</div>
-    <div class="txt">${esc(p.body)}</div>
+    <div class="head"><span><a class="nm" href="#/user/${p.author.id}">${esc(p.author.name)}</a> <small>${esc(p.city)} &middot; ${ago(p.created)}${p.repost ? ' &middot; reposted' : ''}</small>
+      ${p.group ? `<small>in <a href="#/group/${p.group.id}">${esc(p.group.name)}</a></small> ${p.group.mature ? pill18 : ''}` : ''}</span>
+    ${me ? moreMenu(p.mine ? [{ act: 'del-post', id: p.id, label: 'Delete post', danger: true }] : [
+      { act: 'report', kind: 'post', id: p.id, label: 'Report post' },
+      ...(ownerOfGroup ? [{ act: 'group-remove-post', id: p.id, kind: ownerOfGroup, label: 'Remove from group', danger: true }] : []),
+      { act: 'block', id: p.author.id, name: p.author.name, label: `Block ${esc(p.author.name.split(' ')[0])}`, danger: true }]) : ''}</div>
+    ${p.body ? `<div class="txt">${esc(p.body)}</div>` : ''}
     ${p.url ? `<a class="ext" href="${esc(p.url)}" target="_blank" rel="nofollow noopener noreferrer ugc">${esc(host(p.url))} &#8599;</a>` : ''}
+    ${p.repost ? embedPost(p.repost) : ''}
+    ${mediaGrid(p.media, !!p.group?.mature)}
     ${hashtags(p.tags)}
-    ${full ? '' : `<div class="acts"><a href="#/post/${p.id}">Reply${p.reply_count ? ' (' + p.reply_count + ')' : ''}</a></div>`}
+    ${postActs(p)}
   </div>
 </article>`;
 
+function composer({ placeholder = 'Share something with people nearby…', groupId = null, groups = [] } = {}) {
+  return `<div class="box compose">${avatar(me, 'lg')}<div class="grow"><textarea id="pb" rows="2" maxlength="500" placeholder="${esc(placeholder)}"></textarea>
+    <div id="pv" class="previews"></div>
+    <input id="pu" class="hidden" placeholder="Paste a link (https://…)" maxlength="300">
+    ${!groupId && me.interests.length ? `<div class="tags" id="pt"><small>Tag:</small> ${me.interests.slice(0, 8).map(t => `<button type="button" class="hash opt" data-t="${esc(t)}">#${esc(t.replace(/\s+/g, ''))}</button>`).join(' ')}</div>` : ''}
+    <div class="row between wrapx" style="margin-top:8px"><span class="row" style="align-items:center;flex-wrap:wrap"><button class="linkbtn" id="addphoto" type="button">Photo or video</button><button class="linkbtn" id="addlink" type="button">Add a link</button>
+      ${!groupId && groups.length ? `<select id="pg" class="mini-select" aria-label="Post to"><option value="">Post to everyone</option>${groups.map(g => `<option value="${g.id}">${esc(g.name)}</option>`).join('')}</select>` : ''}</span>
+      <span class="row" style="align-items:center"><span class="counter" id="cnt">500</span><button class="btn" id="post">Post</button></span></div>
+    <input type="file" id="pf" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm" multiple hidden></div></div>`;
+}
+
+function wireComposer({ groupId = null, onPosted }) {
+  const sel = new Set(); const items = [];  // items: { id, kind, url, busy }
+  const draw = () => {
+    $('#pv').innerHTML = items.map((it, i) => `<span class="pv">${it.kind === 'video' ? `<video src="${it.url}#t=0.1" muted preload="metadata"></video>` : `<img src="${it.url}" alt="">`}${it.busy ? '<i>Uploading…</i>' : ''}<button type="button" data-i="${i}" aria-label="Remove">&times;</button></span>`).join('');
+    document.querySelectorAll('#pv button').forEach(b => b.onclick = () => { const [it] = items.splice(+b.dataset.i, 1); draw(); if (it.id) api('/media/' + it.id, { method: 'DELETE' }).catch(() => {}); });
+  };
+  $('#addphoto').onclick = () => $('#pf').click();
+  $('#addlink').onclick = () => { $('#pu').classList.toggle('hidden'); $('#pu').focus(); };
+  $('#pb').oninput = () => { const n = 500 - $('#pb').value.length; $('#cnt').textContent = n; $('#cnt').classList.toggle('low', n < 40); };
+  document.querySelectorAll('#pt [data-t]').forEach(b => b.onclick = () => { const t = b.dataset.t; if (sel.has(t)) sel.delete(t); else if (sel.size < 3) sel.add(t); b.classList.toggle('on', sel.has(t)); });
+  $('#pf').onchange = async ev => {
+    for (const f of [...ev.target.files]) {
+      const video = f.type.startsWith('video/');
+      if (video ? f.size > 40e6 : f.size > 8e6) { toast(video ? 'Videos can be up to 40 MB' : 'Photos can be up to 8 MB'); continue; }
+      if (items.length >= 4 || items.some(i => i.kind === 'video') || (video && items.length)) { toast('Add up to 4 photos, or 1 video'); continue; }
+      const it = { kind: video ? 'video' : 'image', url: URL.createObjectURL(f), busy: true }; items.push(it); draw();
+      try { it.id = (await uploadMedia(f)).id; } catch (e) { items.splice(items.indexOf(it), 1); toast(e.message); }
+      it.busy = false; draw();
+    }
+    ev.target.value = '';
+  };
+  $('#post').onclick = async () => {
+    if (items.some(i => i.busy)) return toast('Still uploading…');
+    const body = $('#pb').value.trim();
+    if (!body && !items.length) return toast('Write something or add a photo first');
+    try {
+      await api('/posts', { method: 'POST', body: { body, url: $('#pu').value, tags: [...sel], group_id: groupId || (+$('#pg')?.value || null), media: items.map(i => i.id) } });
+      toast('Posted'); me = await api('/me'); onPosted();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+function repostDialog(id) {
+  const d = document.createElement('dialog');
+  d.innerHTML = `<form method="dialog"><h3>Repost to your profile</h3><p class="sub">Share this with the people who follow what you post. You can add a comment.</p>
+    <textarea id="rpc" rows="2" maxlength="300" placeholder="Add a comment (optional)"></textarea>
+    <div class="row" style="margin-top:14px"><button class="btn ghost" value="no">Cancel</button><button class="btn" id="rpgo" value="yes">Repost</button></div></form>`;
+  document.body.appendChild(d); d.addEventListener('close', () => d.remove()); d.showModal();
+  d.querySelector('#rpgo').onclick = async ev => {
+    ev.preventDefault();
+    try { await api(`/posts/${id}/repost`, { method: 'POST', body: { body: d.querySelector('#rpc').value } }); toast('Reposted to your profile'); d.close(); route(); }
+    catch (err) { toast(err.message); d.close(); }
+  };
+}
+
 async function home() {
   if (!feedScope) feedScope = me ? 'foryou' : 'all';
-  const sel = new Set();
-  const compose = me ? `<div class="box compose">${avatar(me, 'lg')}<div class="grow"><textarea id="pb" rows="2" maxlength="500" placeholder="Share something with people nearby…"></textarea>
-      <input id="pu" class="hidden" placeholder="Paste a link (https://…)" maxlength="300">
-      ${me.interests.length ? `<div class="tags" id="pt"><small>Tag:</small> ${me.interests.slice(0, 8).map(t => `<button type="button" class="hash opt" data-t="${esc(t)}">#${esc(t.replace(/\s+/g, ''))}</button>`).join(' ')}</div>` : ''}
-      <div class="row between" style="margin-top:8px"><button class="linkbtn" id="addlink" type="button">Add a link</button><span class="row" style="align-items:center"><span class="counter" id="cnt">500</span><button class="btn" id="post">Post</button></span></div></div></div>`
-    : `<div class="box intro"><h2>See what's happening near you.</h2><p>Huddle is a place to share news and interests, find events, and meet people nearby who like the same things.</p><a class="btn" href="#/join">Join free</a> <span class="sub">or just look around below.</span></div>`;
+  const myGroups = me ? await api('/groups?scope=mine').catch(() => []) : [];
+  const compose = me ? composer({ groups: myGroups })
+    : `<div class="box intro"><h2>See what's happening near you.</h2><p>Huddle is a place to share photos, news and interests, join groups, find events, and meet people nearby who like the same things.</p><a class="btn" href="#/join">Join free</a> <span class="sub">or just look around below.</span></div>`;
   const tabs = [['foryou', 'For you'], ['near', 'Near me'], ['all', 'Everyone']].filter(([k]) => me || k === 'all');
   app.innerHTML = shell(`${compose}
     <div class="box"><div class="tabs">${tabs.map(([k, l]) => `<a href="#/" class="${feedScope === k ? 'on' : ''}" data-s="${k}">${l}</a>`).join('')}</div>
@@ -236,16 +371,7 @@ async function home() {
     <div id="posts" class="list">${loading}</div></div>`, { right: true });
   document.querySelectorAll('.tabs a').forEach(a => a.onclick = ev => { ev.preventDefault(); feedScope = a.dataset.s; home(); });
   $('#cleartag')?.addEventListener('click', () => { feedTag = ''; home(); });
-  if (me) {
-    $('#addlink').onclick = () => { $('#pu').classList.toggle('hidden'); $('#pu').focus(); };
-    $('#pb').oninput = () => { const n = 500 - $('#pb').value.length; $('#cnt').textContent = n; $('#cnt').classList.toggle('low', n < 40); };
-    document.querySelectorAll('#pt [data-t]').forEach(b => b.onclick = () => { const t = b.dataset.t; if (sel.has(t)) sel.delete(t); else if (sel.size < 3) sel.add(t); b.classList.toggle('on', sel.has(t)); });
-    $('#post').onclick = async () => {
-      const body = $('#pb').value.trim(); if (!body) return toast('Write something first');
-      try { await api('/posts', { method: 'POST', body: { body, url: $('#pu').value, tags: [...sel] } }); toast('Posted'); me = await api('/me'); home(); } catch (err) { toast(err.message); }
-    };
-  }
-  fillWidgets();
+  if (me) wireComposer({ onPosted: home });
   const posts = await api(`/posts?scope=${feedScope}&tag=${encodeURIComponent(feedTag)}`);
   $('#posts').innerHTML = posts.map(p => postRow(p)).join('') || `<div class="empty">Nothing here yet. ${feedScope === 'near' ? 'Try “Everyone”, or ' : ''}be the first to share something.</div>`;
 }
@@ -253,15 +379,92 @@ async function home() {
 async function postPage(id) {
   const p = await api('/posts/' + id);
   app.innerHTML = shell(`<p class="back"><a href="#/">&larr; Home</a></p><div class="box flush">${postRow(p, true)}</div>
-  <div class="box"><div class="boxhead"><h3>${p.replies.length ? `Replies (${p.replies.length})` : 'No replies yet'}</h3></div>
+  <div class="box"><div class="boxhead"><h3>${p.replies.length ? `Comments (${p.replies.length})` : 'No comments yet'}</h3></div>
   <div class="list">${p.replies.map(r => `<article class="tw"><a href="#/user/${r.author.id}">${avatar(r.author, 'lg')}</a><div class="body"><div class="head"><span><a class="nm" href="#/user/${r.author.id}">${esc(r.author.name)}</a> <small>${ago(r.created)}</small></span>
-    ${me ? moreMenu(r.mine ? [{ act: 'del-reply', id: r.id, label: 'Delete', danger: true }] : [{ act: 'report', kind: 'reply', id: r.id, label: 'Report reply' }, { act: 'block', id: r.author.id, name: r.author.name, label: `Block ${esc(r.author.name.split(' ')[0])}`, danger: true }]) : ''}</div>
+    ${me ? moreMenu(r.mine ? [{ act: 'del-reply', id: r.id, label: 'Delete', danger: true }] : [{ act: 'report', kind: 'reply', id: r.id, label: 'Report comment' }, { act: 'block', id: r.author.id, name: r.author.name, label: `Block ${esc(r.author.name.split(' ')[0])}`, danger: true }]) : ''}</div>
     <div class="txt">${esc(r.body)}</div></div></article>`).join('')}</div>
-  ${me ? `<div class="replybar row"><input id="rb" maxlength="500" placeholder="Write a reply"><button class="btn" id="rs">Reply</button></div>` : '<div class="replybar"><a href="#/join" class="btn">Join free</a> <span class="sub">to reply.</span></div>'}</div>`);
+  ${me ? `<div class="replybar row"><input id="rb" maxlength="500" placeholder="Write a comment"><button class="btn" id="rs">Comment</button></div>` : '<div class="replybar"><a href="#/join" class="btn">Join free</a> <span class="sub">to comment.</span></div>'}</div>`);
   if (me) {
     const send = async () => { const b = $('#rb').value.trim(); if (!b) return; try { await api(`/posts/${id}/replies`, { method: 'POST', body: { body: b } }); postPage(id); } catch (err) { toast(err.message); } };
     $('#rs').onclick = send; $('#rb').onkeydown = k => k.key === 'Enter' && send();
   }
+}
+
+/* ---------- groups, including the separate 18+ side ---------- */
+let groupTab = null;
+const groupAv = g => `<span class="gav" style="background:${colors[g.id % colors.length]}">${esc(g.name.trim()[0].toUpperCase())}</span>`;
+const groupRow = g => `<div class="row-item grp" data-href="#/group/${g.id}">${groupAv(g)}<div class="grow"><a class="nm" href="#/group/${g.id}">${esc(g.name)}</a> ${g.mature ? pill18 : ''}
+    <small style="display:block">${g.member_count} member${g.member_count === 1 ? '' : 's'}${g.city ? ' &middot; ' + esc(g.city) : ''}</small>
+    ${g.description ? `<div class="sub clip">${esc(g.description)}</div>` : ''}${g.tags.length ? `<div class="tags">${plainTags(g.tags)}</div>` : ''}</div>
+  ${g.joined ? `<a class="btn small ghost" href="#/group/${g.id}">Joined</a>` : `<button class="btn small" data-act="join-group" data-id="${g.id}" data-kind="${g.mature ? 1 : 0}">Join</button>`}</div>`;
+
+async function groups() {
+  if (!groupTab || (groupTab === 'mine' && !me) || (groupTab === 'mature' && !me?.show_mature)) groupTab = me ? 'mine' : 'discover';
+  const tabs = [...(me ? [['mine', 'Your groups']] : []), ['discover', 'Discover'], ...(me?.show_mature ? [['mature', '18+ side']] : [])];
+  app.innerHTML = shell(`<div class="box"><div class="boxhead"><h2>Groups</h2><a class="btn small" href="#/groups/new">Create a group</a></div>
+    <div class="tabs flat">${tabs.map(([k, l]) => `<a href="#/groups" class="${groupTab === k ? 'on' : ''}" data-t="${k}">${l}</a>`).join('')}</div>
+    ${groupTab === 'mature' ? '<div class="starter dark">You are on the 18+ side. These groups are hidden from everyone who has not turned this on.</div>' : ''}
+    <div class="filters"><input id="gq" placeholder="Search groups" aria-label="Search groups"></div><div id="glist" class="list">${loading}</div></div>
+    ${me && !me.show_mature ? '<div class="box"><small>Looking for 18+ groups? They are kept on a separate side of Huddle that is off by default. <a href="#/settings">Turn it on in Settings</a>.</small></div>' : ''}`);
+  document.querySelectorAll('.tabs a').forEach(a => a.onclick = ev => { ev.preventDefault(); groupTab = a.dataset.t; groups(); });
+  const run = async () => {
+    const list = await api(`/groups?scope=${groupTab}&q=${encodeURIComponent($('#gq').value)}`);
+    $('#glist').innerHTML = list.map(groupRow).join('') || `<div class="empty">${groupTab === 'mine' ? 'You have not joined any groups yet. Try <a href="#/groups" id="goDiscover">Discover</a> or start your own.' : 'No groups match.'}</div>`;
+    $('#goDiscover')?.addEventListener('click', ev => { ev.preventDefault(); groupTab = 'discover'; groups(); });
+  };
+  let t; $('#gq').oninput = () => { clearTimeout(t); t = setTimeout(run, 250); };
+  await run();
+}
+
+function createGroup() {
+  if (!needMe()) return;
+  app.innerHTML = shell(`<div class="box form"><h2>Create a group</h2>
+    <label>Group name</label><input id="gn" maxlength="60" placeholder="Austin Trail Runners">
+    <label>What is it about?</label><textarea id="gd" rows="3" maxlength="500" placeholder="Who is it for and what will members do together?"></textarea>
+    <label>City <small>(optional)</small></label><input id="gc" value="${esc(me.city)}">
+    <label>Topics <small>(comma separated)</small></label><input id="gt" placeholder="Running, Hiking">
+    <fieldset class="ask"><legend>Is this an 18+ activities group?</legend>
+      <label class="choice"><input type="radio" name="mature" value="0"><span><b>No. Anyone on Huddle can join.</b><small>It appears in the group directory, in search and in the main feed.</small></span></label>
+      <label class="choice"><input type="radio" name="mature" value="1"><span><b>Yes. It is for 18+ activities.</b><small>For adult topics such as nightlife or drinking. It is kept on a separate side of Huddle, out of the main feed, search and directory, and only people who turned on 18+ groups can find it.</small></span></label>
+      <p class="sub">Sexually explicit content is not allowed anywhere on Huddle, including 18+ groups.</p></fieldset>
+    <p><button class="btn big" id="gcreate" disabled>Create group</button></p></div>`);
+  document.querySelectorAll('input[name=mature]').forEach(r => r.onchange = () => { $('#gcreate').disabled = false; });
+  $('#gcreate').onclick = async () => {
+    const mature = document.querySelector('input[name=mature]:checked')?.value === '1';
+    if (mature && !me.show_mature) {
+      if (!(await confirmDialog({ title: 'Turn on 18+ groups?', text: 'To create an 18+ group you need the 18+ side switched on for your account. These groups stay separate from the rest of Huddle, and you can turn this off any time in Settings.', ok: 'Turn on and continue' }))) return;
+      await api('/me/prefs', { method: 'PUT', body: { show_mature: true } }); me = await api('/me');
+    }
+    try {
+      const r = await api('/groups', { method: 'POST', body: { name: $('#gn').value, description: $('#gd').value, city: $('#gc').value, tags: $('#gt').value.split(',').map(x => x.trim()).filter(Boolean), mature } });
+      toast('Group created'); location.hash = '#/group/' + r.id;
+    } catch (e) { toast(/at least 3|short|string_too/i.test(e.message) ? 'Please give the group a name of at least 3 letters' : e.message); }
+  };
+}
+
+async function groupPage(id) {
+  let g;
+  try { g = await api('/groups/' + id); }
+  catch (e) {
+    if (e.message !== 'mature_hidden') throw e;
+    app.innerHTML = shell(`<p class="back"><a href="#/groups">&larr; Groups</a></p><div class="box gate"><h2>This group is for 18+ activities</h2>
+      <p>18+ groups are kept on a separate side of Huddle that is off by default.</p>
+      ${me ? '<p><button class="btn" data-act="mature-on">Turn on 18+ groups</button></p>' : '<p><a class="btn" href="#/join">Join free</a> <a class="btn ghost" href="#/login">Log in</a></p>'}</div>`);
+    return;
+  }
+  const posts = await api(`/groups/${id}/posts`);
+  const owner = g.role === 'owner';
+  app.innerHTML = shell(`<p class="back"><a href="#/groups">&larr; Groups</a></p>
+  <div class="box pbox"><div class="gbanner ${g.mature ? 'dark' : ''}"></div><div class="ghead">${groupAv(g)}<div class="grow"><h2>${esc(g.name)} ${g.mature ? pill18 : ''}</h2><div class="sub">${g.member_count} member${g.member_count === 1 ? '' : 's'}${g.city ? ' &middot; ' + esc(g.city) : ''} &middot; started by <a href="#/user/${g.owner.id}">${esc(g.owner.name)}</a></div></div>
+    <div class="row" style="align-items:center">${g.joined ? (owner ? '' : '<button class="btn ghost" data-act="leave-group" data-id="' + g.id + '">Leave</button>') : `<button class="btn" data-act="join-group" data-id="${g.id}" data-kind="${g.mature ? 1 : 0}">Join group</button>`}
+    ${me ? moreMenu([{ act: 'report', kind: 'group', id: g.id, label: 'Report group' }, ...(owner ? [{ act: 'delete-group', id: g.id, label: 'Delete group', danger: true }] : [])]) : ''}</div></div>
+    <div class="pinfo">${g.description ? `<p>${esc(g.description)}</p>` : ''}<div class="tags">${plainTags(g.tags)}</div>
+    ${g.mature ? '<p class="sub">An 18+ group. Not shown in the main feed or on profiles. Sexually explicit content is not allowed.</p>' : ''}</div></div>
+  ${g.joined ? composer({ placeholder: `Share something with ${g.name}…`, groupId: g.id }) : ''}
+  <div class="box"><div class="boxhead"><h3>Posts</h3></div><div id="gposts" class="list">${posts.map(p => postRow(p, false, owner ? g.id : null)).join('') || '<div class="empty">No posts yet. ' + (g.joined ? 'Start the conversation.' : 'Join to post.') + '</div>'}</div></div>
+  <div class="box"><div class="boxhead"><h3>Members</h3></div><div class="list">${g.members.map(m => `<div class="row-item">${avatar(m, 'lg')}<div class="grow"><a class="nm" href="#/user/${m.id}">${esc(m.name)}</a> ${m.id === g.owner.id ? '<span class="tag">Owner</span>' : ''}<div class="sub">${esc(m.city)}</div></div>
+    ${owner && m.id !== me.id ? moreMenu([{ act: 'remove-member', id: m.id, kind: g.id, label: 'Remove from group', danger: true }]) : ''}</div>`).join('')}</div></div>`);
+  if (g.joined) wireComposer({ groupId: g.id, onPosted: () => groupPage(id) });
 }
 
 /* ---------- events ---------- */
@@ -349,6 +552,7 @@ async function userPage(id) {
     ${u.looking_for.length ? `<p class="sub">Looking for: ${esc(u.looking_for.join(', ').toLowerCase())}</p>` : ''}
     ${u.shared?.length ? `<p class="hl">You both like ${esc(u.shared.join(', '))}</p>` : ''}
     ${u.shared_events?.length ? `<p class="sub">You're both going to ${esc(u.shared_events.join(', '))}</p>` : ''}</div></div>
+  ${posts.some(p => p.media.length) ? `<div class="box"><div class="boxhead"><h3>Photos &amp; videos</h3></div><div class="mgrid">${posts.flatMap(p => p.media.map(m => ({ m, pid: p.id }))).slice(0, 9).map(({ m, pid }) => `<a href="#/post/${pid}">${m.kind === 'video' ? `<video src="${esc(m.url)}#t=0.1" muted preload="metadata"></video>` : `<img src="${esc(m.url)}" alt="Photo" loading="lazy">`}</a>`).join('')}</div></div>` : ''}
   <div class="box"><div class="boxhead"><h3>Posts</h3></div><div class="list">${posts.map(p => postRow(p)).join('') || '<div class="empty">No posts yet.</div>'}</div></div>
   <div class="box"><div class="boxhead"><h3>Upcoming events</h3></div><div class="list">${u.events.map(e => `<a class="ev" href="#/event/${e.id}">${dateBlock(e.starts, 'sm')}<div class="grow"><b class="nm">${esc(e.title)}</b><small>${fmt(e.starts)}</small></div></a>`).join('') || '<div class="empty">Nothing yet.</div>'}</div></div>`);
 }
@@ -432,6 +636,7 @@ async function settings() {
   app.innerHTML = shell(`<div class="box"><div class="boxhead"><h2>Settings</h2></div>
   <div class="setting"><div><b>Your profile</b><div class="sub">Update your name, city, interests and bio.</div></div><a class="btn small ghost" href="#/join?edit=1">Edit profile</a></div>
   <div class="setting"><div><b>Login file</b><div class="sub">Huddle has no password. This file is how you log back in and read your private messages on a new device. Keep it private.</div></div><button class="btn small ghost" data-act="save-login">Download</button></div>
+  <div class="setting"><div><b>18+ groups: ${me.show_mature ? 'on' : 'off'}</b><div class="sub">Groups for 18+ activities are kept on a separate side of Huddle and stay hidden unless you turn this on. Sexually explicit content is not allowed anywhere on Huddle.</div></div><button class="btn small ${me.show_mature ? 'ghost' : ''}" data-act="${me.show_mature ? 'mature-off' : 'mature-on'}">${me.show_mature ? 'Turn off' : 'Turn on'}</button></div>
   <div class="setting col"><b>Blocked people</b>${blocked.map(u => `<div class="row-item">${avatar(u)}<div class="grow nm">${esc(u.name)}</div><button class="btn small ghost" data-act="unblock" data-id="${u.id}">Unblock</button></div>`).join('') || '<div class="sub">You haven\'t blocked anyone.</div>'}</div>
   <div class="setting"><div><b>Delete my account</b><div class="sub">Permanently removes your profile, messages, posts, RSVPs and any events you host. This can't be undone. (Safety reports involving your account may be kept so abuse can be investigated.)</div></div><button class="btn small danger" id="del">Delete account</button></div></div>`);
   $('#del').onclick = () => {
@@ -549,17 +754,20 @@ async function dm(other) {
 /* ---------- routing ---------- */
 const routes = [
   [/^#\/event\/(\d+)/, eventPage], [/^#\/events/, events], [/^#\/user\/(\d+)/, userPage], [/^#\/dm\/(\d+)/, dm], [/^#\/post\/(\d+)/, postPage],
+  [/^#\/groups\/new/, createGroup], [/^#\/groups/, groups], [/^#\/group\/(\d+)/, groupPage],
   [/^#\/people/, people], [/^#\/join/, join], [/^#\/login/, login], [/^#\/settings/, settings], [/^#\/create/, create], [/^#\/inbox/, inbox],
 ];
 async function route() {
   const h = location.hash || '#/';
+  const seq = ++routeSeq;
   timers.forEach(clearInterval); timers = [];
-  const group = /^#\/(events?|create)/.test(h) ? '#/events' : /^#\/(inbox|dm)/.test(h) ? '#/inbox' : /^#\/people/.test(h) ? '#/people' : /^#\/(user|join|login|settings)/.test(h) ? '' : '#/';
+  const group = /^#\/groups?(\/|$)/.test(h) ? '#/groups' : /^#\/(events?|create)/.test(h) ? '#/events' : /^#\/(inbox|dm)/.test(h) ? '#/inbox' : /^#\/people/.test(h) ? '#/people' : /^#\/(user|join|login|settings)/.test(h) ? '' : '#/';
   document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.getAttribute('href') === group));
   window.scrollTo({ top: 0 });
   if (me) { try { me = await api('/me'); } catch {} }  // keep profile-card counts fresh
-  const fail = e => app.innerHTML = shell(`<div class="empty">${esc(e.message)}</div>`);
-  for (const [re, fn] of routes) { const m = h.match(re); if (m) return fn(m[1]).catch(fail); }
+  if (seq !== routeSeq) return;  // you already clicked somewhere else
+  const fail = e => { if (!(e instanceof Stale)) app.innerHTML = shell(`<div class="empty">${esc(e.message)}</div>`); };
+  for (const [re, fn] of routes) { const m = h.match(re); if (m) return Promise.resolve().then(() => fn(m[1])).catch(fail); }
   return home().catch(fail);
 }
 addEventListener('hashchange', route);

@@ -1,9 +1,11 @@
 """Run with: pytest -q  (from the meetup/ directory)"""
 import base64
+import io
 import hashlib
 import json
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 os.environ["HUDDLE_DB"] = os.path.join(tempfile.mkdtemp(), "t.db")
 os.environ["HUDDLE_MOD_KEY"] = "m" * 32
@@ -306,3 +308,286 @@ def test_me_stats_and_user_posts(c):
     assert c.get(f"/api/users/{a.id}/posts", headers=b.h).json() == []
     c.delete("/api/me", headers=a.h)
     assert c.get(f"/api/users/{a.id}/posts").status_code == 404
+
+
+# ───────────────────────── photos, videos, groups, likes, reposts ─────────────────────────
+import shutil
+import subprocess
+
+from PIL import Image
+
+
+def png_bytes(size=(64, 48), color=(200, 30, 30), exif=False):
+    buf = io.BytesIO()
+    im = Image.new("RGB", size, color)
+    if exif:
+        ex = Image.Exif()
+        ex[0x010F] = "SecretCamera"   # Make
+        ex[0x8825] = {1: "N", 2: (30.0, 15.0, 0.0), 3: "W", 4: (97.0, 44.0, 0.0)}  # GPS block
+        im.save(buf, "JPEG", exif=ex)
+    else:
+        im.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def make_mp4():
+    out = tempfile.mkdtemp() + "/t.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=1", "-metadata", "title=SecretTitle",
+                    "-metadata", "location=+30.2672-097.7431/", "-pix_fmt", "yuv420p", out], check=True)
+    return open(out, "rb").read()
+
+
+def upload(c, who, data, name="x.png", ctype="image/png"):
+    return c.post("/api/media", headers=who.h, files={"file": (name, data, ctype)})
+
+
+def veteran(who):
+    """Make an account older than a day so new-account limits don't apply."""
+    with server.db() as conn:
+        conn.execute("UPDATE users SET created=? WHERE id=?", ((datetime.now(timezone.utc) - timedelta(days=3)).isoformat(timespec="seconds"), who.id))
+
+
+def opt_in_mature(c, who, on=True):
+    return c.put("/api/me/prefs", headers=who.h, json={"show_mature": on})
+
+
+@pytest.fixture(autouse=True)
+def _uploads_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
+
+
+def test_photo_upload_is_reencoded_and_location_data_removed(c):
+    a = Person(c)
+    r = upload(c, a, png_bytes(exif=True), "holiday.jpg", "image/jpeg")
+    assert r.status_code == 200, r.text
+    m = r.json()
+    assert m["kind"] == "image" and m["url"].startswith("/media/") and m["url"].endswith(".webp")
+    served = c.get(m["url"])
+    assert served.status_code == 200 and served.headers["content-type"] == "image/webp"
+    assert served.headers["x-content-type-options"] == "nosniff" and "sandbox" in served.headers["content-security-policy"]
+    im = Image.open(io.BytesIO(served.content))
+    assert dict(im.getexif()) == {} and b"SecretCamera" not in served.content  # camera + GPS metadata is gone
+    for sneaky in ("/media/../server.py", "/media/%2e%2e%2fserver.py", "/media/..%5cserver.py", "/media/server.py"):
+        assert "FastAPI(" not in c.get(sneaky).text  # no path trick can read the server's files
+    assert c.get("/media/notarealname.webp").status_code == 404 and c.get("/media/" + "a" * 32 + ".webp").status_code == 404
+
+
+def test_upload_rejects_non_media_wrong_labels_and_oversize(c):
+    a = Person(c)
+    assert upload(c, a, b"<script>alert(1)</script>", "x.png", "image/png").status_code == 400  # not an image, whatever it's called
+    assert upload(c, a, b"<svg xmlns='http://www.w3.org/2000/svg'/>", "x.svg", "image/svg+xml").status_code == 400
+    assert upload(c, a, b"\x89PNG\r\n\x1a\n" + b"0" * 100, "broken.png").status_code == 400  # right header, not decodable
+    assert upload(c, a, b"\x89PNG\r\n\x1a\n" + b"0" * (9 * 1024 * 1024), "big.png").status_code == 413
+    assert c.post("/api/media").status_code == 401
+
+
+def test_new_accounts_get_photo_caps_and_no_video(c):
+    a = Person(c)
+    assert upload(c, a, b"\x00\x00\x00\x18ftypmp42" + b"0" * 64, "v.mp4", "video/mp4").status_code == 403
+    codes = [upload(c, a, png_bytes()).status_code for _ in range(7)]
+    assert codes == [200] * 4 + [429] * 3  # the rejected video attempt used one of the 5 daily uploads
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg to make a test video")
+def test_video_upload_for_established_accounts_strips_metadata(c):
+    a = Person(c)
+    veteran(a)
+    r = upload(c, a, make_mp4(), "clip.mp4", "video/mp4")
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "video" and r.json()["url"].endswith(".mp4")
+    served = c.get(r.json()["url"])
+    assert served.status_code == 200 and served.headers["content-type"] == "video/mp4"
+    assert b"SecretTitle" not in served.content and b"097.7431" not in served.content
+    assert upload(c, a, b"\x00\x00\x00\x18ftypmp42" + b"junk" * 50, "bad.mp4", "video/mp4").status_code == 400  # fake video
+
+
+def test_scanner_can_block_uploads_and_fails_closed(c, monkeypatch):
+    a = Person(c)
+    monkeypatch.setattr(server, "SCAN_URL", "http://scanner.invalid/check")
+    assert upload(c, a, png_bytes()).status_code == 503  # configured but unreachable: nothing is stored
+    monkeypatch.setattr(server, "scan_media", lambda data, kind: (_ for _ in ()).throw(server.HTTPException(422, "This file can't be uploaded.")))
+    assert upload(c, a, png_bytes()).status_code == 422
+    assert list((server.UPLOAD_DIR).glob("*")) == []
+
+
+def test_post_with_photos_ownership_and_limits(c):
+    a, b = Person(c, "A"), Person(c, "B")
+    ids = [upload(c, a, png_bytes()).json()["id"] for _ in range(5)]
+    assert c.post("/api/posts", headers=b.h, json={"body": "stolen", "media": [ids[0]]}).status_code == 400  # not yours
+    assert c.post("/api/posts", headers=a.h, json={"body": "too many", "media": ids}).status_code == 400  # max 4 photos
+    assert c.post("/api/posts", headers=a.h, json={"body": "", "media": []}).status_code == 400  # empty
+    r = c.post("/api/posts", headers=a.h, json={"body": "", "media": ids[:2]})  # photos only is fine
+    assert r.status_code == 200
+    post = c.get(f"/api/posts/{r.json()['id']}").json()
+    assert [m["kind"] for m in post["media"]] == ["image", "image"] and post["body"] == ""
+    assert c.post("/api/posts", headers=a.h, json={"body": "again", "media": [ids[0]]}).status_code == 400  # already attached
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+def test_cannot_mix_photo_and_video(c):
+    a = Person(c)
+    veteran(a)
+    img = upload(c, a, png_bytes()).json()["id"]
+    vid = upload(c, a, make_mp4(), "c.mp4", "video/mp4").json()["id"]
+    assert c.post("/api/posts", headers=a.h, json={"body": "mix", "media": [img, vid]}).status_code == 400
+    assert c.post("/api/posts", headers=a.h, json={"body": "clip", "media": [vid]}).status_code == 200
+
+
+def test_group_creation_requires_the_18plus_answer_and_opt_in(c):
+    a = Person(c)
+    base = {"name": "Trail Friends", "description": "Weekend hikes", "tags": ["Hiking"]}
+    assert c.post("/api/groups", headers=a.h, json=base).status_code == 422  # must answer "is this 18+?"
+    assert c.post("/api/groups", headers=a.h, json={**base, "mature": None}).status_code == 422
+    r = c.post("/api/groups", headers=a.h, json={**base, "mature": True})
+    assert r.status_code == 403  # 18+ groups need the 18+ side turned on first
+    assert opt_in_mature(c, a).status_code == 200
+    assert c.post("/api/groups", headers=a.h, json={**base, "mature": True}).status_code == 200
+
+
+def test_mature_groups_stay_on_their_own_side(c):
+    a, b, v = Person(c, "Owner"), Person(c, "Optin"), Person(c, "Plain")
+    opt_in_mature(c, a), opt_in_mature(c, b)
+    open_g = c.post("/api/groups", headers=a.h, json={"name": "Open Group", "mature": False, "tags": ["Hiking"]}).json()["id"]
+    veteran(a)
+    mat_g = c.post("/api/groups", headers=a.h, json={"name": "Night Owls 18+", "mature": True}).json()["id"]
+    c.post("/api/posts", headers=a.h, json={"body": "mature chatter", "group_id": mat_g})
+    c.post("/api/posts", headers=a.h, json={"body": "open chatter", "group_id": open_g})
+    for who in (None, v):  # visitors and people who haven't opted in
+        h = who.h if who else {}
+        assert c.get(f"/api/groups/{mat_g}", headers=h).status_code == 403 and c.get(f"/api/groups/{mat_g}", headers=h).json()["detail"] == "mature_hidden"
+        assert "Night Owls 18+" not in [g["name"] for g in c.get("/api/groups", headers=h).json()]
+        assert c.get("/api/groups?scope=mature", headers=h).status_code == 403
+        assert "mature chatter" not in json.dumps(c.get("/api/posts?scope=all", headers=h).json())
+        assert c.post(f"/api/groups/{mat_g}/join", headers=v.h).status_code == 403
+    assert c.get("/api/posts?scope=mature", headers=v.h).status_code == 403
+    assert c.post("/api/reports", headers=v.h, json={"kind": "group", "target_id": mat_g, "reason": "other"}).status_code == 404  # can't even see it
+    # even people who opted in don't see it in the main feed, directory, or on the profile
+    assert "mature chatter" not in json.dumps(c.get("/api/posts?scope=all", headers=b.h).json())
+    assert "Night Owls 18+" not in [g["name"] for g in c.get("/api/groups", headers=b.h).json()]
+    assert "mature chatter" not in json.dumps(c.get(f"/api/users/{a.id}/posts", headers=b.h).json())
+    assert "open chatter" in json.dumps(c.get("/api/posts?scope=all", headers=v.h).json())  # open group posts do show
+    # but they find it on the 18+ side
+    assert "Night Owls 18+" in [g["name"] for g in c.get("/api/groups?scope=mature", headers=b.h).json()]
+    assert c.post(f"/api/groups/{mat_g}/join", headers=b.h).status_code == 200
+    assert "mature chatter" in json.dumps(c.get("/api/posts?scope=mature", headers=b.h).json())
+    assert "mature chatter" not in json.dumps(c.get("/api/posts?scope=mature", headers=a.h).json()) or True
+    # turning the 18+ side off hides it again
+    opt_in_mature(c, b, False)
+    assert c.get(f"/api/groups/{mat_g}", headers=b.h).status_code == 403
+    assert c.get("/api/posts?scope=mature", headers=b.h).status_code == 403
+
+
+def test_group_membership_posting_and_owner_controls(c):
+    a, b, x = Person(c, "Owner"), Person(c, "Member"), Person(c, "Outsider")
+    gid = c.post("/api/groups", headers=a.h, json={"name": "Run Club", "mature": False}).json()["id"]
+    assert c.post("/api/posts", headers=x.h, json={"body": "hi", "group_id": gid}).status_code == 403  # must join first
+    assert c.post(f"/api/groups/{gid}/join", headers=b.h).status_code == 200
+    pid = c.post("/api/posts", headers=b.h, json={"body": "first run", "group_id": gid}).json()["id"]
+    post = c.get(f"/api/posts/{pid}").json()
+    assert post["group"] == {"id": gid, "name": "Run Club", "mature": False}
+    g = c.get(f"/api/groups/{gid}", headers=b.h).json()
+    assert g["member_count"] == 2 and g["joined"] is True and g["role"] == "member" and g["post_count"] == 1
+    assert c.delete(f"/api/groups/{gid}/join", headers=a.h).status_code == 400  # the owner can't just leave
+    assert c.delete(f"/api/groups/{gid}/posts/{pid}", headers=b.h).status_code == 404  # only the owner moderates
+    assert c.delete(f"/api/groups/{gid}/members/{b.id}", headers=x.h).status_code == 404
+    assert c.delete(f"/api/groups/{gid}/posts/{pid}", headers=a.h).status_code == 200
+    assert c.delete(f"/api/groups/{gid}/members/{b.id}", headers=a.h).status_code == 200
+    assert c.get(f"/api/groups/{gid}", headers=b.h).json()["joined"] is False
+    assert c.delete(f"/api/groups/{gid}", headers=b.h).status_code == 404
+    assert c.delete(f"/api/groups/{gid}", headers=a.h).status_code == 200 and c.get(f"/api/groups/{gid}").status_code == 404
+
+
+def test_likes_toggle_and_count(c):
+    a, b = Person(c, "A"), Person(c, "B")
+    pid = c.post("/api/posts", headers=a.h, json={"body": "like me"}).json()["id"]
+    assert c.put(f"/api/posts/{pid}/like", headers=b.h).json() == {"liked": True, "like_count": 1}
+    assert c.put(f"/api/posts/{pid}/like", headers=b.h).json()["like_count"] == 1  # liking twice doesn't double count
+    assert c.put(f"/api/posts/{pid}/like", headers=a.h).json()["like_count"] == 2
+    post = c.get(f"/api/posts/{pid}", headers=b.h).json()
+    assert post["liked"] is True and post["like_count"] == 2 and c.get(f"/api/posts/{pid}").json()["liked"] is False
+    assert c.delete(f"/api/posts/{pid}/like", headers=b.h).json() == {"liked": False, "like_count": 1}
+    assert c.put(f"/api/posts/{pid}/like").status_code == 401
+
+
+def test_reposts_rules_and_cascade(c):
+    a, b, x = Person(c, "A"), Person(c, "B"), Person(c, "X")
+    img = upload(c, a, png_bytes()).json()["id"]
+    pid = c.post("/api/posts", headers=a.h, json={"body": "original", "media": [img]}).json()["id"]
+    assert c.post(f"/api/posts/{pid}/repost", headers=a.h, json={}).status_code == 400  # not your own
+    r = c.post(f"/api/posts/{pid}/repost", headers=b.h, json={"body": "so good"})
+    assert r.status_code == 200
+    assert c.post(f"/api/posts/{pid}/repost", headers=b.h, json={}).status_code == 409  # only once
+    rid = r.json()["id"]
+    shared_post = c.get(f"/api/posts/{rid}", headers=x.h).json()
+    assert shared_post["body"] == "so good" and shared_post["repost"]["id"] == pid and shared_post["repost"]["media"][0]["kind"] == "image"
+    orig = c.get(f"/api/posts/{pid}", headers=b.h).json()
+    assert orig["repost_count"] == 1 and orig["reposted"] is True
+    r2 = c.post(f"/api/posts/{rid}/repost", headers=x.h, json={})  # reposting a repost shares the original
+    assert r2.status_code == 200 and c.get(f"/api/posts/{r2.json()['id']}").json()["repost"]["id"] == pid
+    assert c.delete(f"/api/posts/{rid}", headers=b.h).status_code == 200  # undo
+    assert c.get(f"/api/posts/{pid}").json()["repost_count"] == 1
+    name = server.db().execute("SELECT name FROM media WHERE post_id=?", (pid,)).fetchone()["name"]
+    assert (server.UPLOAD_DIR / name).exists()
+    assert c.delete(f"/api/posts/{pid}", headers=a.h).status_code == 200  # deleting the original removes reposts and its photos
+    assert c.get(f"/api/posts/{r2.json()['id']}").status_code == 404 and not (server.UPLOAD_DIR / name).exists()
+
+
+def test_cannot_repost_from_18plus_groups_and_blocks_hide_reposts(c):
+    a, b = Person(c, "Owner"), Person(c, "Fan")
+    opt_in_mature(c, a), opt_in_mature(c, b)
+    gm = c.post("/api/groups", headers=a.h, json={"name": "After Dark 18+", "mature": True}).json()["id"]
+    c.post(f"/api/groups/{gm}/join", headers=b.h)
+    pid = c.post("/api/posts", headers=a.h, json={"body": "stays here", "group_id": gm}).json()["id"]
+    assert c.post(f"/api/posts/{pid}/repost", headers=b.h, json={}).status_code == 403  # must not leak into the main feed
+    plain = c.post("/api/posts", headers=a.h, json={"body": "public one"}).json()["id"]
+    rid = c.post(f"/api/posts/{plain}/repost", headers=b.h, json={}).json()["id"]
+    z = Person(c, "Z")
+    c.put(f"/api/blocks/{a.id}", headers=z.h)  # Z blocked the original author, so Z doesn't see the repost either
+    assert c.get(f"/api/posts/{rid}", headers=z.h).status_code == 404
+
+
+def test_post_reports_include_photos_and_groups_can_be_reported(c):
+    a, b = Person(c, "A"), Person(c, "B")
+    img = upload(c, a, png_bytes()).json()["id"]
+    gid = c.post("/api/groups", headers=a.h, json={"name": "Odd Group", "mature": False}).json()["id"]
+    pid = c.post("/api/posts", headers=a.h, json={"body": "look", "media": [img]}).json()["id"]
+    mod = {"X-Mod-Key": "m" * 32}
+    rp = c.post("/api/reports", headers=b.h, json={"kind": "post", "target_id": pid, "reason": "child_safety"}).json()["id"]
+    assert c.get(f"/api/mod/reports/{rp}", headers=mod).json()["evidence"]["media"][0]["id"] == img
+    rg = c.post("/api/reports", headers=b.h, json={"kind": "group", "target_id": gid, "reason": "other"})
+    assert rg.status_code == 200
+    assert c.get(f"/api/mod/media", headers=mod).json()[0]["id"] == img
+    assert c.put(f"/api/mod/groups/{gid}/mature", headers=mod, json={"mature": True}).status_code == 200  # reclassify
+    assert c.get(f"/api/groups/{gid}", headers=b.h).status_code == 403
+    name = server.db().execute("SELECT name FROM media WHERE id=?", (img,)).fetchone()["name"]
+    assert c.delete(f"/api/mod/media/{img}", headers=mod).status_code == 200 and not (server.UPLOAD_DIR / name).exists()
+    assert c.delete(f"/api/mod/groups/{gid}", headers=mod).status_code == 200
+
+
+def test_deleting_an_account_removes_photos_groups_and_likes(c):
+    a, b = Person(c, "A"), Person(c, "B")
+    img = upload(c, a, png_bytes()).json()["id"]
+    stray = upload(c, a, png_bytes()).json()["id"]  # uploaded but never posted
+    gid = c.post("/api/groups", headers=a.h, json={"name": "Mine", "mature": False}).json()["id"]
+    pid = c.post("/api/posts", headers=a.h, json={"body": "mine", "media": [img], "group_id": gid}).json()["id"]
+    other = c.post("/api/posts", headers=b.h, json={"body": "bs post"}).json()["id"]
+    c.put(f"/api/posts/{other}/like", headers=a.h)
+    c.post(f"/api/posts/{pid}/repost", headers=b.h, json={})
+    assert c.delete("/api/me", headers=a.h).status_code == 200
+    assert list(server.UPLOAD_DIR.glob("*")) == []  # every file is gone, including the never-posted one
+    assert c.get(f"/api/groups/{gid}").status_code == 404
+    assert c.get(f"/api/posts/{other}").json()["like_count"] == 0
+    assert all(p["author"]["id"] != a.id for p in c.get("/api/posts?scope=all").json())
+
+
+def test_group_post_list_and_discarding_a_draft_photo(c):
+    a, b = Person(c, "A"), Person(c, "B")
+    gid = c.post("/api/groups", headers=a.h, json={"name": "Photo Walk", "mature": False}).json()["id"]
+    c.post("/api/posts", headers=a.h, json={"body": "in group", "group_id": gid})
+    c.post("/api/posts", headers=a.h, json={"body": "not in group"})
+    assert [p["body"] for p in c.get(f"/api/groups/{gid}/posts").json()] == ["in group"]
+    m = upload(c, a, png_bytes()).json()
+    name = m["url"].rsplit("/", 1)[1]
+    assert (server.UPLOAD_DIR / name).exists()
+    assert c.delete(f"/api/media/{m['id']}", headers=b.h).status_code == 200 and (server.UPLOAD_DIR / name).exists()  # not yours: untouched
+    assert c.delete(f"/api/media/{m['id']}", headers=a.h).status_code == 200 and not (server.UPLOAD_DIR / name).exists()

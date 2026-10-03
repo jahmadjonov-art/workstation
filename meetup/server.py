@@ -1,12 +1,17 @@
 import base64
 import hashlib
 import hmac
+import io
 import json
+import logging
 import os
 import random
 import re
 import secrets
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 import time
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
@@ -14,9 +19,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
 BASE = Path(__file__).parent
@@ -53,7 +59,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL, bio TEXT DEFAULT '',
     pronouns TEXT DEFAULT '', interests TEXT DEFAULT '[]', looking_for TEXT DEFAULT '[]',
-    created TEXT NOT NULL, public_key TEXT, token_hash TEXT, suspended INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0
+    created TEXT NOT NULL, public_key TEXT, token_hash TEXT, suspended INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0,
+    show_mature INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL,
@@ -75,7 +82,23 @@ CREATE TABLE IF NOT EXISTS dms (
 );
 CREATE TABLE IF NOT EXISTS posts (
     id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL,
-    url TEXT DEFAULT '', tags TEXT DEFAULT '[]', city TEXT NOT NULL, created TEXT NOT NULL
+    url TEXT DEFAULT '', tags TEXT DEFAULT '[]', city TEXT NOT NULL, created TEXT NOT NULL,
+    group_id INTEGER, repost_of INTEGER
+);
+CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '', owner_id INTEGER NOT NULL,
+    city TEXT DEFAULT '', tags TEXT DEFAULT '[]', mature INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL, user_id INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'member', joined TEXT NOT NULL,
+    PRIMARY KEY (group_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS likes (
+    post_id INTEGER NOT NULL, user_id INTEGER NOT NULL, created TEXT NOT NULL, PRIMARY KEY (post_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS media (
+    id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, post_id INTEGER, kind TEXT NOT NULL, name TEXT NOT NULL UNIQUE,
+    width INTEGER DEFAULT 0, height INTEGER DEFAULT 0, bytes INTEGER DEFAULT 0, created TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS replies (
     id INTEGER PRIMARY KEY, post_id INTEGER NOT NULL REFERENCES posts(id),
@@ -117,9 +140,14 @@ def migrate(conn):
         "FROM dms GROUP BY a, b"
     )
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
-    for name, ddl in [("public_key", "TEXT"), ("token_hash", "TEXT"), ("suspended", "INTEGER DEFAULT 0"), ("deleted", "INTEGER DEFAULT 0")]:
+    for name, ddl in [("public_key", "TEXT"), ("token_hash", "TEXT"), ("suspended", "INTEGER DEFAULT 0"), ("deleted", "INTEGER DEFAULT 0"),
+                      ("show_mature", "INTEGER NOT NULL DEFAULT 0")]:
         if name not in cols:
             conn.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+    pcols = {r["name"] for r in conn.execute("PRAGMA table_info(posts)")}
+    for name in ("group_id", "repost_of"):
+        if name not in pcols:
+            conn.execute(f"ALTER TABLE posts ADD COLUMN {name} INTEGER")
 
 
 def seed(conn):
@@ -187,6 +215,20 @@ def seed_posts(conn):
         when = (datetime.now(timezone.utc) - timedelta(hours=3 + i * 7)).isoformat(timespec="seconds")
         conn.execute("INSERT INTO posts (user_id, body, url, tags, city, created) VALUES (?,?,?,?,?,?)", (uid, body, url, json.dumps(tags), "Austin", when))
     conn.execute("INSERT INTO replies (post_id, user_id, body, created) VALUES (1, 6, 'Love that loop. Was it busy?', ?)", (now(),))
+    groups = [
+        ("Austin Trail Runners", "Early-morning runs, trail swaps and race-day company. All paces welcome.", ["Running", "Hiking"], 0, 6, [1, 2, 3]),
+        ("Board Game Crew", "Weekly game nights and a shared wishlist. Newcomers get a teacher.", ["Board games"], 0, 3, [8, 1]),
+        ("Cocktail Hour (18+)", "Tasting nights and bar crawls for people who enjoy a drink. 18+ side of Huddle.", ["Cooking", "Travel"], 1, 4, [5]),
+    ]
+    for name, desc, tags, mature, owner, members in groups:
+        gid = conn.execute("INSERT INTO groups (name, description, owner_id, city, tags, mature, created) VALUES (?,?,?,?,?,?,?)",
+                           (name, desc, owner, "Austin", json.dumps(tags), mature, now())).lastrowid
+        conn.execute("INSERT INTO group_members VALUES (?,?,?,?)", (gid, owner, "owner", now()))
+        for m in members:
+            conn.execute("INSERT OR IGNORE INTO group_members VALUES (?,?,?,?)", (gid, m, "member", now()))
+        if gid == 1:
+            conn.execute("INSERT INTO posts (user_id, body, url, tags, city, created, group_id) VALUES (6, ?, '', ?, 'Austin', ?, ?)",
+                         ("Saturday long run: 14 km on the Greenbelt, easy pace, coffee after. Who is in?", json.dumps(["Running"]), now(), gid))
     conn.commit()
 
 
@@ -196,6 +238,9 @@ def startup():
         migrate(conn)
         seed(conn)
         seed_posts(conn)
+    if not SCAN_URL:
+        log.warning("Photo/video uploads are ON but no safety scanner is configured (HUDDLE_MEDIA_SCAN_URL). "
+                    "Do not open this site to the public until uploads are scanned for child sexual abuse material.")
 
 
 # ── Abuse protection ──────────────────────────────────────────────────────────
@@ -293,7 +338,7 @@ def _auth(request: Request, required: bool):
         return None
     if r["suspended"]:
         raise HTTPException(403, "This account has been suspended")
-    return {**user_dict(r), "created": r["created"]}
+    return {**user_dict(r), "created": r["created"], "show_mature": bool(r["show_mature"])}
 
 
 def me_req(request: Request):
@@ -590,8 +635,10 @@ def user_posts(uid: int, v=Depends(me_opt)):
         u = conn.execute("SELECT suspended, deleted FROM users WHERE id=?", (uid,)).fetchone()
         if not u or u["suspended"] or u["deleted"]:
             raise HTTPException(404, "This account no longer exists")
-        rows = conn.execute("SELECT * FROM posts WHERE user_id=? ORDER BY id DESC LIMIT 30", (uid,)).fetchall()
-        return [post_dict(conn, r, v["id"] if v else 0) for r in rows]
+        hide = hidden_users(conn, v["id"] if v else 0)
+        rows = conn.execute("SELECT * FROM posts WHERE user_id=? ORDER BY id DESC LIMIT 60", (uid,)).fetchall()
+        rows = [r for r in rows if in_main_feed(conn, r) and post_visible(conn, r, v, hide)]
+        return [post_dict(conn, r, v["id"] if v else 0) for r in rows[:30]]
 
 
 @app.get("/api/me/matches")
@@ -803,8 +850,14 @@ def delete_me(me=Depends(me_req)):
             conn.execute("DELETE FROM events WHERE id=?", (e,))
         conn.execute("DELETE FROM event_messages WHERE user_id=?", (uid,))
         conn.execute("DELETE FROM rsvps WHERE user_id=?", (uid,))
-        conn.execute("DELETE FROM replies WHERE user_id=? OR post_id IN (SELECT id FROM posts WHERE user_id=?)", (uid, uid))
-        conn.execute("DELETE FROM posts WHERE user_id=?", (uid,))
+        for g in conn.execute("SELECT id FROM groups WHERE owner_id=?", (uid,)).fetchall():
+            purge_group(conn, g["id"])
+        for p in conn.execute("SELECT id FROM posts WHERE user_id=?", (uid,)).fetchall():
+            purge_post(conn, p["id"])
+        conn.execute("DELETE FROM replies WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM likes WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM group_members WHERE user_id=?", (uid,))
+        drop_media(conn, conn.execute("SELECT id, name FROM media WHERE user_id=?", (uid,)).fetchall())
         conn.execute(
             "UPDATE users SET name='Deleted user', city='', bio='', pronouns='', interests='[]', looking_for='[]', "
             "public_key=NULL, token_hash=NULL, deleted=1 WHERE id=?", (uid,),
@@ -812,14 +865,321 @@ def delete_me(me=Depends(me_req)):
     return {"ok": True}
 
 
-# ── Feed: share news and interests ────────────────────────────────────────────
+# ── Media: photos and videos ──────────────────────────────────────────────────
+# Safety notes: files are identified by their bytes (never their name), photos are re-encoded (which also removes
+# location data), videos get metadata stripped when ffmpeg is present, new accounts get fewer uploads and no
+# video, and every file can pass through an external scanner (HUDDLE_MEDIA_SCAN_URL) before it is stored.
+log = logging.getLogger("huddle")
+UPLOAD_DIR = Path(os.environ.get("HUDDLE_UPLOADS", str(BASE / "uploads")))
+MAX_IMAGE, MAX_VIDEO, MAX_PIXELS = 8 * 1024 * 1024, 40 * 1024 * 1024, 40_000_000
+SCAN_URL = os.environ.get("HUDDLE_MEDIA_SCAN_URL", "")
+FFMPEG = shutil.which("ffmpeg")
+MEDIA_NAME_RE = re.compile(r"^[a-f0-9]{32}\.(webp|mp4|webm)$")
+MEDIA_TYPES = {"webp": "image/webp", "mp4": "video/mp4", "webm": "video/webm"}
+Image.MAX_IMAGE_PIXELS = MAX_PIXELS
+
+
+def sniff_media(data: bytes):
+    """Identify an upload from its first bytes: 'image', 'mp4', 'webm' or None."""
+    if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:4] == b"GIF8" or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"):
+        return "image"
+    if data[4:8] == b"ftyp":
+        return "mp4"
+    if data[:4] == b"\x1a\x45\xdf\xa3":
+        return "webm"
+    return None
+
+
+def process_image(data: bytes):
+    try:
+        im = Image.open(io.BytesIO(data))
+        if im.width * im.height > MAX_PIXELS:
+            raise HTTPException(400, "That photo is too large. Try a smaller one.")
+        im.load()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(400, "That photo couldn't be read")
+    im = ImageOps.exif_transpose(im)
+    im.thumbnail((2048, 2048))
+    im = im.convert("RGBA" if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info else "RGB")
+    out = io.BytesIO()
+    im.save(out, "WEBP", quality=85, method=4)  # re-encoding drops EXIF, including GPS location
+    return out.getvalue(), im.width, im.height
+
+
+def process_video(data: bytes, ext: str):
+    if not FFMPEG:
+        return data  # no ffmpeg: stored as uploaded (metadata is not stripped). See README.
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = Path(d) / f"in.{ext}", Path(d) / f"out.{ext}"
+        src.write_bytes(data)
+        cmd = [FFMPEG, "-y", "-v", "error", "-i", str(src), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-map_metadata", "-1"]
+        cmd += ["-movflags", "+faststart"] if ext == "mp4" else []
+        try:
+            res = subprocess.run(cmd + [str(dst)], capture_output=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(400, "That video took too long to process")
+        if res.returncode != 0 or not dst.exists():
+            raise HTTPException(400, "That video couldn't be read")
+        return dst.read_bytes()
+
+
+def scan_media(data: bytes, kind: str):
+    """Send the file to an external safety scanner (hash matching such as PhotoDNA/NCMEC tooling, or a classifier).
+    The scanner must answer {"allowed": true}. If it is configured but unreachable, uploads fail closed."""
+    if not SCAN_URL:
+        return
+    import urllib.request
+    req = urllib.request.Request(SCAN_URL, data=data, method="POST", headers={"Content-Type": "application/octet-stream", "X-Media-Kind": kind})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            allowed = json.loads(r.read()).get("allowed") is True
+    except Exception:
+        if os.environ.get("HUDDLE_SCAN_FAIL_OPEN") == "1":
+            return
+        raise HTTPException(503, "Upload check is unavailable. Please try again later.")
+    if not allowed:
+        raise HTTPException(422, "This file can't be uploaded.")
+
+
+@app.post("/api/media")
+def upload_media(file: UploadFile = File(...), me=Depends(me_req)):
+    limiter.check(f"upload:{me['id']}", 5 if is_new(me) else 40, DAY, "You've reached today's upload limit.")
+    data = file.file.read(MAX_VIDEO + 1)
+    if len(data) > MAX_VIDEO:
+        raise HTTPException(413, "That file is too large (videos can be up to 40 MB)")
+    kind = sniff_media(data)
+    if kind is None:
+        raise HTTPException(400, "Use a JPEG, PNG, GIF or WebP photo, or an MP4 or WebM video.")
+    w = h = 0
+    if kind == "image":
+        if len(data) > MAX_IMAGE:
+            raise HTTPException(413, "Photos can be up to 8 MB")
+        out, w, h = process_image(data)
+        ext, mkind = "webp", "image"
+    else:
+        if is_new(me):
+            raise HTTPException(403, "Videos unlock after your first day on Huddle. Photos are fine now.")
+        out, ext, mkind = process_video(data, kind), kind, "video"
+    scan_media(out, mkind)
+    name = f"{secrets.token_hex(16)}.{ext}"
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    (UPLOAD_DIR / name).write_bytes(out)
+    with db() as conn:
+        cur = conn.execute("INSERT INTO media (user_id, kind, name, width, height, bytes, created) VALUES (?,?,?,?,?,?,?)", (me["id"], mkind, name, w, h, len(out), now()))
+        return {"id": cur.lastrowid, "kind": mkind, "url": f"/media/{name}", "width": w, "height": h}
+
+
+@app.delete("/api/media/{mid}")
+def delete_upload(mid: int, me=Depends(me_req)):
+    """Remove an upload that was never attached to a post (for example, a photo taken out of a draft)."""
+    with db() as conn:
+        drop_media(conn, conn.execute("SELECT id, name FROM media WHERE id=? AND user_id=? AND post_id IS NULL", (mid, me["id"])).fetchall())
+        return {"ok": True}
+
+
+@app.get("/media/{name}")
+def serve_media(name: str):
+    if not MEDIA_NAME_RE.match(name) or not (UPLOAD_DIR / name).is_file():
+        raise HTTPException(404, "Not found")
+    return FileResponse(UPLOAD_DIR / name, media_type=MEDIA_TYPES[name.rsplit(".", 1)[1]], headers={
+        "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox",
+        "Cross-Origin-Resource-Policy": "same-origin", "Cache-Control": "private, max-age=3600"})
+
+
+def drop_media(conn, rows):
+    for r in rows:
+        try:
+            (UPLOAD_DIR / r["name"]).unlink()
+        except OSError:
+            pass
+        conn.execute("DELETE FROM media WHERE id=?", (r["id"],))
+
+
+def media_for(conn, pid):
+    return [{"id": m["id"], "kind": m["kind"], "url": f"/media/{m['name']}", "width": m["width"], "height": m["height"]}
+            for m in conn.execute("SELECT * FROM media WHERE post_id=? ORDER BY id", (pid,))]
+
+
+# ── Groups, including the separate 18+ side ───────────────────────────────────
+# A group is either open to everyone or an 18+ group, and its creator must say which. 18+ groups never appear in
+# the main feed, search, group directory, trends or profiles. Only members who switched on "18+ groups" in Settings
+# can find them. Sexually explicit content is not allowed anywhere on Huddle, 18+ groups included.
+def can_view_group(g, viewer):
+    return bool(g) and (not g["mature"] or bool(viewer and viewer.get("show_mature")))
+
+
+def need_group(conn, gid, viewer):
+    g = conn.execute("SELECT * FROM groups WHERE id=?", (gid,)).fetchone()
+    if not g:
+        raise HTTPException(404, "Group not found")
+    if not can_view_group(g, viewer):
+        raise HTTPException(403, "mature_hidden")
+    return g
+
+
+def group_dict(conn, g, viewer=None):
+    d = {
+        "id": g["id"], "name": g["name"], "description": g["description"], "city": g["city"], "tags": json.loads(g["tags"]),
+        "mature": bool(g["mature"]), "created": g["created"], "owner": get_user(conn, g["owner_id"]),
+        "member_count": conn.execute("SELECT COUNT(*) FROM group_members WHERE group_id=?", (g["id"],)).fetchone()[0],
+        "post_count": conn.execute("SELECT COUNT(*) FROM posts WHERE group_id=? AND repost_of IS NULL", (g["id"],)).fetchone()[0],
+    }
+    if viewer:
+        m = conn.execute("SELECT role FROM group_members WHERE group_id=? AND user_id=?", (g["id"], viewer["id"])).fetchone()
+        d["joined"], d["role"] = bool(m), (m["role"] if m else None)
+    return d
+
+
+class GroupIn(BaseModel):
+    name: str = Field(min_length=3, max_length=60)
+    description: str = Field(default="", max_length=500)
+    city: str = Field(default="", max_length=80)
+    tags: list[str] = []
+    mature: bool  # required on purpose: the creator must answer "is this an 18+ group?"
+
+
+@app.get("/api/groups")
+def list_groups(scope: str = "discover", q: str = "", v=Depends(me_opt)):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM groups ORDER BY id DESC").fetchall()
+        if scope == "mature":
+            if not v or not v["show_mature"]:
+                raise HTTPException(403, "mature_hidden")
+            rows = [g for g in rows if g["mature"]]
+        else:
+            rows = [g for g in rows if not g["mature"]]
+        if scope == "mine":
+            if not v:
+                raise HTTPException(401, "Please sign in")
+            mine = {r["group_id"] for r in conn.execute("SELECT group_id FROM group_members WHERE user_id=?", (v["id"],))}
+            rows = [g for g in rows if g["id"] in mine]
+        text = q.lower().split()
+        out = []
+        for g in rows:
+            d = group_dict(conn, g, v)
+            if text and not all(t in " ".join([g["name"], g["description"], g["tags"], g["city"]]).lower() for t in text):
+                continue
+            d["_s"] = (len(shared(v, {"interests": d["tags"]})) * 3 if v else 0) + (2 if v and g["city"] and g["city"].lower() == v["city"].lower() else 0) + d["member_count"] * 0.1
+            out.append(d)
+        out.sort(key=lambda d: -d["_s"])
+        for d in out:
+            d.pop("_s")
+        return out[:50]
+
+
+@app.post("/api/groups")
+def create_group(g: GroupIn, me=Depends(me_req)):
+    if g.mature and not me["show_mature"]:
+        raise HTTPException(403, "Turn on 18+ groups in Settings before creating one.")
+    limiter.check(f"group:{me['id']}", 1 if is_new(me) else 3, DAY, "You can create 1 group a day at first, then 3.")
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO groups (name, description, owner_id, city, tags, mature, created) VALUES (?,?,?,?,?,?,?)",
+            (g.name.strip(), g.description.strip(), me["id"], g.city.strip(), json.dumps(clean_list(g.tags, 6)), int(g.mature), now()),
+        )
+        conn.execute("INSERT INTO group_members VALUES (?,?,?,?)", (cur.lastrowid, me["id"], "owner", now()))
+        return {"id": cur.lastrowid}
+
+
+@app.get("/api/groups/{gid}")
+def get_group(gid: int, v=Depends(me_opt)):
+    with db() as conn:
+        g = need_group(conn, gid, v)
+        d = group_dict(conn, g, v)
+        d["members"] = [get_user(conn, m["user_id"]) for m in conn.execute(
+            "SELECT m.user_id FROM group_members m JOIN users u ON u.id=m.user_id WHERE m.group_id=? AND u.deleted=0 AND u.suspended=0 ORDER BY (m.role='owner') DESC, m.joined LIMIT 30", (gid,))]
+        return d
+
+
+@app.get("/api/groups/{gid}/posts")
+def group_posts(gid: int, v=Depends(me_opt)):
+    with db() as conn:
+        need_group(conn, gid, v)
+        hide = hidden_users(conn, v["id"] if v else 0)
+        rows = conn.execute("SELECT * FROM posts WHERE group_id=? AND repost_of IS NULL ORDER BY id DESC LIMIT 100", (gid,)).fetchall()
+        return [post_dict(conn, r, v["id"] if v else 0) for r in rows if post_visible(conn, r, v, hide)][:60]
+
+
+@app.post("/api/groups/{gid}/join")
+def join_group(gid: int, me=Depends(me_req)):
+    limiter.check(f"gjoin:{me['id']}", 10 if is_new(me) else 60, DAY, "You've joined a lot of groups today.")
+    with db() as conn:
+        need_group(conn, gid, me)
+        conn.execute("INSERT OR IGNORE INTO group_members VALUES (?,?,?,?)", (gid, me["id"], "member", now()))
+        return {"ok": True}
+
+
+@app.delete("/api/groups/{gid}/join")
+def leave_group(gid: int, me=Depends(me_req)):
+    with db() as conn:
+        m = conn.execute("SELECT role FROM group_members WHERE group_id=? AND user_id=?", (gid, me["id"])).fetchone()
+        if m and m["role"] == "owner":
+            raise HTTPException(400, "Owners can't leave their group. You can delete it instead.")
+        conn.execute("DELETE FROM group_members WHERE group_id=? AND user_id=?", (gid, me["id"]))
+        return {"ok": True}
+
+
+def purge_group(conn, gid):
+    for p in conn.execute("SELECT id FROM posts WHERE group_id=?", (gid,)).fetchall():
+        purge_post(conn, p["id"])
+    conn.execute("DELETE FROM group_members WHERE group_id=?", (gid,))
+    conn.execute("DELETE FROM groups WHERE id=?", (gid,))
+
+
+def is_owner(conn, gid, uid):
+    return bool(conn.execute("SELECT 1 FROM group_members WHERE group_id=? AND user_id=? AND role='owner'", (gid, uid)).fetchone())
+
+
+@app.delete("/api/groups/{gid}")
+def delete_group(gid: int, me=Depends(me_req)):
+    with db() as conn:
+        if not is_owner(conn, gid, me["id"]):
+            raise HTTPException(404, "Group not found")
+        purge_group(conn, gid)
+        return {"ok": True}
+
+
+@app.delete("/api/groups/{gid}/members/{uid}")
+def remove_member(gid: int, uid: int, me=Depends(me_req)):
+    with db() as conn:
+        if not is_owner(conn, gid, me["id"]) or uid == me["id"]:
+            raise HTTPException(404, "Not found")
+        conn.execute("DELETE FROM group_members WHERE group_id=? AND user_id=?", (gid, uid))
+        return {"ok": True}
+
+
+@app.delete("/api/groups/{gid}/posts/{pid}")
+def remove_group_post(gid: int, pid: int, me=Depends(me_req)):
+    with db() as conn:
+        if not is_owner(conn, gid, me["id"]) or not conn.execute("SELECT 1 FROM posts WHERE id=? AND group_id=?", (pid, gid)).fetchone():
+            raise HTTPException(404, "Not found")
+        purge_post(conn, pid)
+        return {"ok": True}
+
+
+class PrefsIn(BaseModel):
+    show_mature: bool
+
+
+@app.put("/api/me/prefs")
+def set_prefs(p: PrefsIn, me=Depends(me_req)):
+    with db() as conn:
+        conn.execute("UPDATE users SET show_mature=? WHERE id=?", (int(p.show_mature), me["id"]))
+    return {"show_mature": p.show_mature}
+
+
+# ── Feed: photos, videos and news, with comments, likes and reposts ───────────
 LINK_RE = re.compile(r"https?://|www\.", re.I)
 
 
 class PostIn(BaseModel):
-    body: str = Field(min_length=1, max_length=500)
+    body: str = Field(default="", max_length=500)
     url: str = Field(default="", max_length=300)
     tags: list[str] = []
+    group_id: int | None = None
+    media: list[int] = []
 
 
 def clean_url(u):
@@ -832,24 +1192,74 @@ def clean_url(u):
     return u
 
 
-def post_dict(conn, r, viewer_id=0):
-    return {
+def post_dict(conn, r, viewer_id=0, nested=True):
+    d = {
         "id": r["id"], "body": r["body"], "url": r["url"], "tags": json.loads(r["tags"]), "city": r["city"], "created": r["created"],
         "author": get_user(conn, r["user_id"]), "mine": r["user_id"] == viewer_id,
         "reply_count": conn.execute("SELECT COUNT(*) FROM replies WHERE post_id=?", (r["id"],)).fetchone()[0],
+        "like_count": conn.execute("SELECT COUNT(*) FROM likes WHERE post_id=?", (r["id"],)).fetchone()[0],
+        "liked": bool(viewer_id and conn.execute("SELECT 1 FROM likes WHERE post_id=? AND user_id=?", (r["id"], viewer_id)).fetchone()),
+        "repost_count": conn.execute("SELECT COUNT(*) FROM posts WHERE repost_of=?", (r["id"],)).fetchone()[0],
+        "reposted": bool(viewer_id and conn.execute("SELECT 1 FROM posts WHERE repost_of=? AND user_id=?", (r["id"], viewer_id)).fetchone()),
+        "media": media_for(conn, r["id"]), "group": None, "repost": None,
     }
+    if r["group_id"]:
+        g = conn.execute("SELECT id, name, mature FROM groups WHERE id=?", (r["group_id"],)).fetchone()
+        if g:
+            d["group"] = {"id": g["id"], "name": g["name"], "mature": bool(g["mature"])}
+    if r["repost_of"] and nested:
+        o = conn.execute("SELECT * FROM posts WHERE id=?", (r["repost_of"],)).fetchone()
+        d["repost"] = post_dict(conn, o, viewer_id, nested=False) if o else None
+    return d
+
+
+def post_visible(conn, r, viewer, hide):
+    """Can this viewer see this post at all? (blocks, suspended/deleted authors, 18+ groups, reposts of hidden people)"""
+    a = conn.execute("SELECT suspended, deleted FROM users WHERE id=?", (r["user_id"],)).fetchone()
+    if not a or a["suspended"] or a["deleted"] or r["user_id"] in hide:
+        return False
+    if r["group_id"] and not can_view_group(conn.execute("SELECT * FROM groups WHERE id=?", (r["group_id"],)).fetchone(), viewer):
+        return False
+    if r["repost_of"]:
+        o = conn.execute("SELECT user_id FROM posts WHERE id=?", (r["repost_of"],)).fetchone()
+        if not o or o["user_id"] in hide:
+            return False
+    return True
+
+
+def in_main_feed(conn, r):
+    if not r["group_id"]:
+        return True
+    g = conn.execute("SELECT mature FROM groups WHERE id=?", (r["group_id"],)).fetchone()
+    return bool(g) and not g["mature"]
+
+
+def purge_post(conn, pid):
+    """Delete a post with everything attached to it: comments, likes, photos/videos, and reposts of it."""
+    for i in [pid] + [r["id"] for r in conn.execute("SELECT id FROM posts WHERE repost_of=?", (pid,))]:
+        conn.execute("DELETE FROM replies WHERE post_id=?", (i,))
+        conn.execute("DELETE FROM likes WHERE post_id=?", (i,))
+        drop_media(conn, conn.execute("SELECT id, name FROM media WHERE post_id=?", (i,)).fetchall())
+        conn.execute("DELETE FROM posts WHERE id=?", (i,))
 
 
 @app.get("/api/posts")
 def list_posts(scope: str = "foryou", tag: str = "", v=Depends(me_opt)):
     with db() as conn:
-        hide = hidden_users(conn, v["id"] if v else 0)
-        rows = conn.execute(
-            "SELECT p.* FROM posts p JOIN users u ON u.id=p.user_id WHERE u.suspended=0 AND u.deleted=0 ORDER BY p.id DESC LIMIT 200"
-        ).fetchall()
+        vid = v["id"] if v else 0
+        hide = hidden_users(conn, vid)
+        if scope == "mature" and not (v and v["show_mature"]):
+            raise HTTPException(403, "mature_hidden")
+        mine = {r["group_id"] for r in conn.execute("SELECT group_id FROM group_members WHERE user_id=?", (vid,))} if v else set()
+        rows = conn.execute("SELECT * FROM posts ORDER BY id DESC LIMIT 300").fetchall()
         out = []
         for rank, r in enumerate(rows):
-            if r["user_id"] in hide:
+            if scope == "mature":
+                if not r["group_id"] or r["group_id"] not in mine or in_main_feed(conn, r):
+                    continue
+            elif not in_main_feed(conn, r):
+                continue
+            if not post_visible(conn, r, v, hide):
                 continue
             tags = json.loads(r["tags"])
             if tag and tag.lower() not in [t.lower() for t in tags]:
@@ -857,7 +1267,7 @@ def list_posts(scope: str = "foryou", tag: str = "", v=Depends(me_opt)):
             same_city = bool(v) and r["city"].lower() == v["city"].lower()
             if scope == "near" and not same_city:
                 continue
-            p = post_dict(conn, r, v["id"] if v else 0)
+            p = post_dict(conn, r, vid)
             overlap = len(shared(v, {"interests": tags})) if v else 0
             p["_score"] = overlap * 3 + (2 if same_city else 0) - rank * 0.05
             p["match"] = shared(v, {"interests": tags}) if v else []
@@ -872,32 +1282,52 @@ def list_posts(scope: str = "foryou", tag: str = "", v=Depends(me_opt)):
 @app.post("/api/posts")
 def create_post(p: PostIn, me=Depends(me_req)):
     body = p.body.strip()
-    if not body:
-        raise HTTPException(400, "Write something first")
+    if not body and not p.media:
+        raise HTTPException(400, "Write something or add a photo first")
     url = clean_url(p.url)
     if is_new(me) and (url or LINK_RE.search(body)):
         raise HTTPException(403, "Links unlock after your first day on Huddle. It keeps spam out.")
     limiter.check(f"post:{me['id']}", 3 if is_new(me) else 20, DAY, "You've reached today's posting limit.")
     limiter.check(f"post-min:{me['id']}", 3, 60)
     with db() as conn:
-        last = conn.execute("SELECT body FROM posts WHERE user_id=? ORDER BY id DESC LIMIT 1", (me["id"],)).fetchone()
-        if last and last["body"] == body:
+        if p.group_id:
+            g = need_group(conn, p.group_id, me)
+            if not conn.execute("SELECT 1 FROM group_members WHERE group_id=? AND user_id=?", (g["id"], me["id"])).fetchone():
+                raise HTTPException(403, "Join the group to post in it")
+        items = []
+        for mid in dict.fromkeys(p.media):
+            m = conn.execute("SELECT * FROM media WHERE id=? AND user_id=? AND post_id IS NULL", (mid, me["id"])).fetchone()
+            if not m:
+                raise HTTPException(400, "One of those uploads isn't available. Please add it again.")
+            items.append(m)
+        videos = [m for m in items if m["kind"] == "video"]
+        if len(items) > 4 or len(videos) > 1 or (videos and len(items) > 1):
+            raise HTTPException(400, "Add up to 4 photos, or 1 video.")
+        last = conn.execute("SELECT body FROM posts WHERE user_id=? AND repost_of IS NULL ORDER BY id DESC LIMIT 1", (me["id"],)).fetchone()
+        if body and last and last["body"] == body:
             raise HTTPException(400, "You already posted that")
         cur = conn.execute(
-            "INSERT INTO posts (user_id, body, url, tags, city, created) VALUES (?,?,?,?,?,?)",
-            (me["id"], body, url, json.dumps(clean_list(p.tags, 3)), me["city"], now()),
+            "INSERT INTO posts (user_id, body, url, tags, city, created, group_id) VALUES (?,?,?,?,?,?,?)",
+            (me["id"], body, url, json.dumps(clean_list(p.tags, 3)), me["city"], now(), p.group_id),
         )
+        for m in items:
+            conn.execute("UPDATE media SET post_id=? WHERE id=?", (cur.lastrowid, m["id"]))
         return {"id": cur.lastrowid}
+
+
+def need_post(conn, pid, viewer):
+    r = conn.execute("SELECT * FROM posts WHERE id=?", (pid,)).fetchone()
+    if not r or not post_visible(conn, r, viewer, hidden_users(conn, viewer["id"] if viewer else 0)):
+        raise HTTPException(404, "Post not found")
+    return r
 
 
 @app.get("/api/posts/{pid}")
 def get_post(pid: int, v=Depends(me_opt)):
     with db() as conn:
-        r = conn.execute("SELECT p.* FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=? AND u.suspended=0", (pid,)).fetchone()
+        r = need_post(conn, pid, v)
         vid = v["id"] if v else 0
         hide = hidden_users(conn, vid)
-        if not r or r["user_id"] in hide:
-            raise HTTPException(404, "Post not found")
         out = post_dict(conn, r, vid)
         out["replies"] = [
             {"id": x["id"], "body": x["body"], "created": x["created"], "author": get_user(conn, x["user_id"]), "mine": x["user_id"] == vid}
@@ -920,13 +1350,51 @@ def reply(pid: int, rp: ReplyIn, me=Depends(me_req)):
     limiter.check(f"reply-min:{me['id']}", 6, 60)
     limiter.check(f"reply-hr:{me['id']}", 20 if is_new(me) else 120, HOUR)
     with db() as conn:
-        p = conn.execute("SELECT user_id FROM posts WHERE id=?", (pid,)).fetchone()
-        if not p:
-            raise HTTPException(404, "Post not found")
-        if p["user_id"] in hidden_users(conn, me["id"]):
-            raise HTTPException(403, "You can't reply to this post")
+        need_post(conn, pid, me)
         conn.execute("INSERT INTO replies (post_id, user_id, body, created) VALUES (?,?,?,?)", (pid, me["id"], body, now()))
         return {"ok": True}
+
+
+@app.put("/api/posts/{pid}/like")
+def like_post(pid: int, me=Depends(me_req)):
+    limiter.check(f"like:{me['id']}", 30, 60)
+    limiter.check(f"like-d:{me['id']}", 150 if is_new(me) else 1000, DAY)
+    with db() as conn:
+        need_post(conn, pid, me)
+        conn.execute("INSERT OR IGNORE INTO likes VALUES (?,?,?)", (pid, me["id"], now()))
+        return {"liked": True, "like_count": conn.execute("SELECT COUNT(*) FROM likes WHERE post_id=?", (pid,)).fetchone()[0]}
+
+
+@app.delete("/api/posts/{pid}/like")
+def unlike_post(pid: int, me=Depends(me_req)):
+    with db() as conn:
+        conn.execute("DELETE FROM likes WHERE post_id=? AND user_id=?", (pid, me["id"]))
+        return {"liked": False, "like_count": conn.execute("SELECT COUNT(*) FROM likes WHERE post_id=?", (pid,)).fetchone()[0]}
+
+
+class RepostIn(BaseModel):
+    body: str = Field(default="", max_length=300)
+
+
+@app.post("/api/posts/{pid}/repost")
+def repost(pid: int, rp: RepostIn, me=Depends(me_req)):
+    limiter.check(f"repost:{me['id']}", 5 if is_new(me) else 40, DAY, "You've reached today's repost limit.")
+    body = rp.body.strip()
+    if is_new(me) and LINK_RE.search(body):
+        raise HTTPException(403, "Links unlock after your first day on Huddle. It keeps spam out.")
+    with db() as conn:
+        r = need_post(conn, pid, me)
+        if r["repost_of"]:  # reposting a repost shares the original
+            r = need_post(conn, r["repost_of"], me)
+        if r["group_id"] and not in_main_feed(conn, r):
+            raise HTTPException(403, "Posts from 18+ groups can't be reposted.")
+        if r["user_id"] == me["id"]:
+            raise HTTPException(400, "You can't repost your own post")
+        if conn.execute("SELECT 1 FROM posts WHERE repost_of=? AND user_id=?", (r["id"], me["id"])).fetchone():
+            raise HTTPException(409, "You already reposted this")
+        cur = conn.execute("INSERT INTO posts (user_id, body, url, tags, city, created, repost_of) VALUES (?,?,?,?,?,?,?)",
+                           (me["id"], body, "", "[]", me["city"], now(), r["id"]))
+        return {"id": cur.lastrowid}
 
 
 @app.delete("/api/posts/{pid}")
@@ -935,8 +1403,7 @@ def delete_post(pid: int, me=Depends(me_req)):
         r = conn.execute("SELECT user_id FROM posts WHERE id=?", (pid,)).fetchone()
         if not r or r["user_id"] != me["id"]:
             raise HTTPException(404, "Post not found")
-        conn.execute("DELETE FROM replies WHERE post_id=?", (pid,))
-        conn.execute("DELETE FROM posts WHERE id=?", (pid,))
+        purge_post(conn, pid)
         return {"ok": True}
 
 
@@ -955,7 +1422,7 @@ REPORT_REASONS = ["child_safety", "harassment", "spam", "scam", "other"]
 
 
 class ReportIn(BaseModel):
-    kind: str  # dm | event_message | user | event | post | reply
+    kind: str  # dm | event_message | user | event | post | reply | group
     target_id: int
     reason: str
     details: str = Field(default="", max_length=1000)
@@ -1008,13 +1475,20 @@ def create_report(rep: ReportIn, me=Depends(me_req)):
             if not p:
                 raise HTTPException(404, "Post not found")
             target_user = p["user_id"]
-            evidence = {"body": p["body"], "url": p["url"], "posted": p["created"]}
+            evidence = {"body": p["body"], "url": p["url"], "posted": p["created"], "group_id": p["group_id"], "repost_of": p["repost_of"],
+                        "media": [{"id": m["id"], "kind": m["kind"], "name": m["name"]} for m in conn.execute("SELECT * FROM media WHERE post_id=?", (p["id"],))]}
         elif rep.kind == "reply":
             p = conn.execute("SELECT * FROM replies WHERE id=?", (rep.target_id,)).fetchone()
             if not p:
                 raise HTTPException(404, "Reply not found")
             target_user = p["user_id"]
             evidence = {"post_id": p["post_id"], "body": p["body"], "posted": p["created"]}
+        elif rep.kind == "group":
+            g = conn.execute("SELECT * FROM groups WHERE id=?", (rep.target_id,)).fetchone()
+            if not g or not can_view_group(g, me):
+                raise HTTPException(404, "Group not found")
+            target_user = g["owner_id"]
+            evidence = {"name": g["name"], "description": g["description"], "mature": bool(g["mature"])}
         elif rep.kind == "event":
             e = conn.execute("SELECT * FROM events WHERE id=?", (rep.target_id,)).fetchone()
             if not e:
@@ -1147,8 +1621,7 @@ def mod_posts(user_id: int = 0, limit: int = 50, mod=Depends(mod_req)):
 @app.delete("/api/mod/posts/{pid}")
 def mod_delete_post(pid: int, mod=Depends(mod_req)):
     with db() as conn:
-        conn.execute("DELETE FROM replies WHERE post_id=?", (pid,))
-        conn.execute("DELETE FROM posts WHERE id=?", (pid,))
+        purge_post(conn, pid)
     audit(mod, "delete_post", f"post={pid}")
     return {"ok": True}
 
@@ -1158,6 +1631,56 @@ def mod_delete_reply(rid: int, mod=Depends(mod_req)):
     with db() as conn:
         conn.execute("DELETE FROM replies WHERE id=?", (rid,))
     audit(mod, "delete_reply", f"reply={rid}")
+    return {"ok": True}
+
+
+@app.get("/api/mod/groups")
+def mod_groups(mature: int = -1, mod=Depends(mod_req)):
+    audit(mod, "list_groups", f"mature={mature}")
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM groups ORDER BY id DESC LIMIT 200").fetchall()
+        return [group_dict(conn, g) for g in rows if mature < 0 or bool(g["mature"]) == bool(mature)]
+
+
+class MatureIn(BaseModel):
+    mature: bool
+
+
+@app.put("/api/mod/groups/{gid}/mature")
+def mod_set_mature(gid: int, body: MatureIn, mod=Depends(mod_req)):
+    """Reclassify a group (for example one that was labelled open but is really 18+)."""
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM groups WHERE id=?", (gid,)).fetchone():
+            raise HTTPException(404, "Group not found")
+        conn.execute("UPDATE groups SET mature=? WHERE id=?", (int(body.mature), gid))
+    audit(mod, "set_group_mature", f"group={gid} mature={body.mature}")
+    return {"ok": True}
+
+
+@app.delete("/api/mod/groups/{gid}")
+def mod_delete_group(gid: int, mod=Depends(mod_req)):
+    with db() as conn:
+        purge_group(conn, gid)
+    audit(mod, "delete_group", f"group={gid}")
+    return {"ok": True}
+
+
+@app.get("/api/mod/media")
+def mod_media(user_id: int = 0, limit: int = 50, mod=Depends(mod_req)):
+    audit(mod, "list_media", f"user={user_id}")
+    with db() as conn:
+        q, args = "SELECT * FROM media", []
+        if user_id:
+            q += " WHERE user_id=?"
+            args.append(user_id)
+        return [{**dict(r), "url": f"/media/{r['name']}"} for r in conn.execute(q + " ORDER BY id DESC LIMIT ?", args + [min(max(limit, 1), 200)])]
+
+
+@app.delete("/api/mod/media/{mid}")
+def mod_delete_media(mid: int, mod=Depends(mod_req)):
+    with db() as conn:
+        drop_media(conn, conn.execute("SELECT id, name FROM media WHERE id=?", (mid,)).fetchall())
+    audit(mod, "delete_media", f"media={mid}")
     return {"ok": True}
 
 
