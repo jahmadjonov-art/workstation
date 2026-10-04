@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Huddle Corp: a private workspace for your company</title>
+<meta name="theme-color" content="#1b2528">
+<link rel="stylesheet" href="/static/corp.css">
+<link rel="stylesheet" href="/static/search.css">
+</head>
+<body>
+<header class="topbar"><div class="wrap">
+  <a class="logo" href="#/">huddle<span>corp</span></a>
+  <span id="wsname" class="wsname"></span>
+  <span class="lockbadge" title="Content is encrypted in your browser">Encrypted</span>
+  <div class="spacer"></div>
+  <a class="switch" href="/huddle" title="Switch to your regular Huddle account">Switch to Huddle</a>
+  <div id="me"></div>
+</div></header>
+<div id="banner"></div>
+<main id="app"></main>
+<div id="toast" role="status"></div>
+<script src="/static/crypto.js"></script>
+<script>
+  // Opened as a plain file, or the app script can't load: explain what to do instead of showing a blank page.
+  function corpOffline() {
+    document.getElementById('app').innerHTML = '<div style="max-width:520px;margin:40px auto;padding:20px;background:#fff;border:1px solid #ccd6d3;border-radius:4px;font:14px/1.5 Helvetica,Arial,sans-serif;color:#20282b">'
+      + '<h2 style="margin:0 0 8px;font-size:1.25rem">Can\'t connect to Huddle Corp</h2>'
+      + '<p>This page needs its server running, so it can\'t work when opened as a file.</p>'
+      + '<p style="color:#5c6a70">Run <code>uvicorn server:app</code> in the <code>meetup</code> folder, then visit <code>http://localhost:8000/corp</code>.</p></div>';
+  }
+  if (location.protocol === 'file:') corpOffline();
+</script>
+<script src="/static/search.js"></script>
+<script src="/static/corp.js"></script>
+<script>if (!window.__appLoaded) corpOffline();</script>
+</body>
+</html>

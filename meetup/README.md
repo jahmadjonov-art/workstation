@@ -1,0 +1,173 @@
+# Huddle
+
+Two separate products on one site:
+
+| Path | Product |
+|---|---|
+| `/` | A chooser, like the front door of huddle.com |
+| `/huddle` | **Huddle**: meet people near you (events, groups, feed, photos, private messages) |
+| `/corp` | **Huddle Corp**: private, end-to-end encrypted workspaces for companies |
+
+They have different accounts, tables and APIs (`/api/...` and `/api/corp/...`). Nothing is shared between them. The rest of
+this README is about Huddle until the Huddle Corp section below.
+
+A meetup site focused on connection: see who's going, what you share with them, and say hello easily. Open to everyone.
+
+## Huddle Corp (private company workspaces)
+A company creates a workspace and invites its people. Inside: **chat** (channels, direct messages, private groups),
+**tasks** (a board with status, assignee, due date and comments), **workflows** (a checklist you run for a person or
+project, which creates owned, dated tasks, with a built-in *New hire onboarding*), **pages** (company page, handbook,
+policies), **events** with RSVPs, **incentive programs**, and a **People** directory with roles (owner, admin, manager,
+member), job titles, new-hire flags and key fingerprints. Admins can create invite links; owners can delete the workspace.
+
+**What "encrypted" means here.** All content (messages, task titles and details, comments, pages, workflows, events, incentives)
+is encrypted in the member's browser (AES-GCM). Each *scope* (the whole company, or a private group) has its own key.
+Keys are handed to teammates wrapped with an ECDH-derived secret, automatically, by any member who already holds the key,
+so no one needs a server-side key and no admin needs to be online. Ciphertext is bound to its workspace, scope, type and
+parent, so the server can't move it elsewhere. When someone is removed from a scope the key is rotated by a remaining
+member's browser, so they can't read what is said afterwards. Private groups are cryptographically private, not just hidden.
+
+**What the server can see:** who is in a workspace and scope, roles and titles, task status / assignee / due date, event
+times, who created what and when, and the activity log (actions, never content). That is what lets the app work.
+
+**Limits, stated plainly**
+- Huddle can't read content, reset a lost key, or search it. Search happens in the browser. A lost login file means lost
+  access, so sign-up and Settings push people to save it. A teammate who still holds the key can be re-invited.
+- A *malicious server operator* could add a fake member and receive key grants. Members can compare the key fingerprints on
+  the People page to catch this. Signed membership (as in the MLS protocol) would close the gap.
+- Removing someone doesn't erase what they already read or copied, and old messages stay under the old key.
+- Huddle can't moderate encrypted workspaces, so the terms of service need to carry that, and there is no legal-hold or
+  eDiscovery export yet. Both matter to larger companies.
+- Not built yet: SSO/SAML, two-factor, email verification, file attachments, search, notifications, owner transfer.
+- Run it on its own origin in production (for example `corp.example.com`) so a bug in the social site can never reach
+  workspace keys, which live in the browser's storage for the same origin.
+
+## Try it without a server
+`python demo/build_demo.py` writes `demo/dist/huddle-demo.html`: one file you can double-click. It opens on the same
+chooser as the real site. Both products are the real front ends talking to pretend servers inside the page
+(`demo/mock-backend.js`, `demo/mock-corp-backend.js`), seeded with sample people who have real encryption keys.
+In Huddle Corp you jump in as an admin of a pretend company whose teammates reply in genuinely encrypted channels. Nothing is saved and reloading starts over. Use it to
+look around or show the site to someone.
+
+Opening `static/index.html` directly does not work, because the real site needs its server. The page now says
+so ("Can't connect to the Huddle server") instead of failing quietly.
+
+## Run
+```
+cd meetup
+pip install -r requirements.txt
+uvicorn server:app --reload
+```
+Open http://localhost:8000 for the chooser, http://localhost:8000/huddle for the social site, or http://localhost:8000/corp for Huddle Corp. A SQLite database (`huddle.db`) is created and seeded with sample data on first start.
+
+## What it feels like
+- **Join in under a minute**: first name, city, birthday, tap a few interests, one button. No password or email.
+  You land on events picked for you; a small banner offers to save your login file.
+- **Photos and videos**: attach up to 4 photos or 1 video to any post, shown in the feed and in a photo grid on
+  profiles. Photos are re-encoded on upload (which removes location data); videos have metadata stripped when
+  `ffmpeg` is installed. New accounts can post photos (5 a day) but not video until they are a day old.
+- **Likes, comments and reposts**: like a post, comment on it, or repost it to your profile with an optional note.
+  Reposts show the original underneath and disappear if the original is deleted.
+- **Groups**: join or start a group, post to it, and see its posts in your feed. Owners can remove posts and members.
+- **The 18+ side**: when someone creates a group they must answer "Is this an 18+ activities group?". 18+ groups stay
+  on a separate side. They never appear in the main feed, search, group directory, trends or profiles, and
+  can't be reposted. People only see them after switching on "18+ groups" in Settings, and joining asks for
+  confirmation. Photos in them are blurred until tapped. Sexually explicit content is not allowed anywhere.
+- **Feed**: share news, finds and links, tagged by interest. "For you" ranks by your interests and city.
+  Reply on a post. New accounts can't post links for 24 hours (anti-spam).
+- **Message requests**: tap Message on anyone and send one first message as a request. They see it (with what
+  you have in common), then Accept, Decline or Block. Until they accept you can't send more; replying also
+  accepts. Declining is silent and permanent, so the sender just keeps seeing "Request sent" and can't pester.
+  Requests can be reported before accepting. A badge on Messages shows how many are waiting.
+- **Live chats**: they update on their own, and a waiting screen unlocks by itself the moment a request is accepted.
+- **A plain, friendly timeline look** in the spirit of the early-2010s social web: charcoal top bar, three columns
+  (your profile card, the timeline, "people you may like" and nearby events), flat white panels with thin rules,
+  blue links and #hashtags, calendar-page date blocks for events, and a classic dim dark mode. Fast, subtle hover
+  fades only; motion is off for people who prefer reduced motion. System fonts, no third-party requests.
+
+## Connection features
+- **Interest matching**: events and people ranked by what you have in common ("Best for me", People tab).
+- **Who's going**: every attendee shows shared interests with you.
+- **Icebreakers + event conversation**: RSVP'd attendees can chat, with one-tap conversation starters.
+- **Direct messages** with a shared-interest conversation starter.
+- **Inclusive profiles**: optional pronouns, "looking for" goals (friends, activity partners, networking...), no gender field.
+
+## Privacy and safety model
+**Direct messages are end-to-end encrypted.** Each browser generates an ECDH P-256 key pair at sign-up and
+keeps the private key. A per-conversation AES-GCM key is derived from your private key and the other person's
+public key (WebCrypto). The server stores only ciphertext and holds no keys, so neither Huddle nor anyone with
+database access can read DMs. Both people can compare a safety number to detect a man-in-the-middle.
+
+**How moderation works without a backdoor**
+- A participant can *report a conversation*. Their browser decrypts and discloses that one thread's key; the
+  server verifies it against the stored ciphertext, then saves up to 100 messages as report evidence.
+  Other conversations stay private. Nothing else gives moderators DM access.
+- Event chats, profiles and events are not E2EE (they are public to attendees), so moderators can read and
+  delete them, and users are told they are reviewed.
+- Moderator API (`/api/mod/*`; set `HUDDLE_DOCS=1` to expose `/docs`, off by default): list/read/resolve reports (child-safety reports sorted first),
+  suspend users, read/delete event messages, read the audit log. Auth: `X-Mod-Key` header matching the
+  `HUDDLE_MOD_KEY` env var (24+ chars; the API is disabled if unset). Every call is written to an audit log.
+- Safety by design: 18+ only (birth date checked once, not stored), every new conversation starts as a request
+  the recipient must accept, blocking, and per-account limits (new accounts: 3 new requests a day, 1 hosted
+  event, no links for 24 hours).
+
+**Easy to join, hard to bot**: no password or email. Sign-up needs a small proof-of-work (a couple of seconds in
+the browser; it automatically gets harder if sign-ups spike), plus a honeypot field, single-use signed
+challenges and per-IP limits. Event chat, RSVPs, hosting and DMs are rate-limited per account.
+
+**Accounts**: your login and private key live in the browser. The *login file* (offered after sign-up and in Settings)
+It is the only way to restore your account and read old messages on a new device. Lose it and the messages are
+unrecoverable by design.
+
+## Photos, videos and child safety
+Uploads are the highest-risk part of any social site. What is built in: files are identified by their bytes, never
+their name; photos are decoded and re-encoded; new accounts have tighter upload limits and no video; links and
+uploads are rate limited; every post, comment, group and profile has Report; moderators can list and delete media
+and groups; and every upload can pass through an external scanner. What is **not** built in, and must be before
+public launch: a hash-matching service for child sexual abuse material.
+
+Set `HUDDLE_MEDIA_SCAN_URL` to an HTTP endpoint that receives each file (`POST`, raw bytes, `X-Media-Kind: image|video`)
+and answers `{"allowed": true}` or `{"allowed": false}`. If it is configured but unreachable, uploads fail closed
+(set `HUDDLE_SCAN_FAIL_OPEN=1` to override, not recommended). The server logs a warning at start-up while no scanner is set.
+Examples to look at: PhotoDNA, NCMEC hash lists via an approved provider, Cloudflare's CSAM scanning tool, Thorn Safer.
+
+## Configuration
+| Env var | Purpose |
+|---|---|
+| `HUDDLE_MOD_KEY` | Enables the moderator API (24+ chars) |
+| `HUDDLE_SECRET` | Signs sign-up challenges; set it so they survive restarts and multiple workers |
+| `HUDDLE_TRUST_PROXY=1` | Use `X-Forwarded-For` for the client IP, only behind a proxy you control |
+| `HUDDLE_DOCS=1` | Serve the interactive API docs at `/docs` (off by default so the API map isn't public) |
+| `HUDDLE_HSTS=1` | Send `Strict-Transport-Security`; turn on once you serve over HTTPS |
+| `HUDDLE_SEARCH_URL` | Base URL of your SearXNG instance; turns on the Search page |
+| `HUDDLE_DB` | SQLite path |
+| `HUDDLE_UPLOADS` | Folder for uploaded photos and videos (default `meetup/uploads/`) |
+| `HUDDLE_MEDIA_SCAN_URL` | Safety scanner every upload is sent to before it is stored |
+| `HUDDLE_SCAN_FAIL_OPEN` | `1` lets uploads through if the scanner is down (default: fail closed) |
+
+## Clean web search
+Both products have a **Search** page (`#/web`) that returns plain results: no ads, no sponsored links, tracking tags stripped, and nothing about what you searched is stored. Results come from a [SearXNG](https://github.com/searxng/searxng) instance you run (free, self-hosted; it blends many engines and shows no ads). Set `HUDDLE_SEARCH_URL=http://your-searxng:8080` (its `settings.yml` must allow `json` format). The server makes the request, so the engines never see your visitors' IP, cookies or accounts. Without that setting, search says it isn't switched on. This is a search page inside Huddle, not a replacement browser.
+
+## One place, two accounts
+Huddle and Huddle Corp live on the same domain (`/huddle` and `/corp`). A **Huddle Corp** link in the social header and a **Switch to Huddle** link in the Corp header move between them. The login file you download from either side can carry both accounts, so one file signs you in to both on a new device. The server keeps the two accounts completely unlinked: your work identity is never visible to the social side and vice versa; only your own device knows both. Because both run on one origin, the strict Content-Security-Policy and output escaping are what keep one side from touching the other (see `SECURITY.md`).
+
+## Revenue principles (not built yet)
+Ads are a future option, not a feature today. If added: contextual to a group's topic (a camping group sees camping gear), sparse, clearly labelled "Sponsored", with no tracking across groups and none in DMs. Huddle Corp never shows ads; a small paid plan for Corp is possible later. The 18+ side stays ad-free unless decided otherwise.
+
+## Before going public
+- **Scan uploads** for child sexual abuse material (see above), and have a process for reporting it. In the US,
+  providers must report apparent CSAM to NCMEC.
+- **Register a DMCA agent** and have a way to take down copyright-infringing uploads (US safe harbor).
+- **Check the name.** "Huddle" is a common word and at least one company already uses it. Search trademarks, or rename.
+- **Explicit content.** The rules ban it everywhere because the age gate is a self-declaration. If you ever want to
+  allow it, you need real age verification and legal advice first.
+- Move uploads to object storage (S3 or similar) behind a CDN, and add video transcoding and thumbnails.
+- Serve over HTTPS (browsers only allow WebCrypto on HTTPS or localhost).
+- The age check is a self-declaration, not verification. For stronger protection add ID or age-estimation
+  checks, plus hash-matching (e.g. NCMEC/PhotoDNA) if you ever allow image uploads.
+- If you operate in the US/EU/UK, get legal advice on child-safety reporting duties (e.g. NCMEC reporting) and
+  build a report-handling process around the moderator API.
+- Add optional email or phone verification, and move rate limiting to Redis when running multiple workers.
+
+## Tests
+`pytest -q` runs the API tests: sign-up abuse protection, ciphertext-only storage, moderator boundaries, blocking, the feed, uploads, groups and the 18+ side, and Huddle Corp (key grants and rotation, roles, private groups, invites, workflow runs, and that the database never holds readable content).
